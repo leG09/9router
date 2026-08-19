@@ -4,7 +4,7 @@ import { useState, useEffect } from "react";
 import PropTypes from "prop-types";
 import { Button, Modal } from "@/shared/components";
 
-export default function AddCustomModelModal({ isOpen, providerAlias, providerDisplayAlias, onSave, onClose }) {
+export default function AddCustomModelModal({ isOpen, providerAlias, providerDisplayAlias, suggestedModels = [], onSave, onClose }) {
   const [modelId, setModelId] = useState("");
   const [testStatus, setTestStatus] = useState(null); // null | "testing" | "ok" | "error"
   const [testError, setTestError] = useState("");
@@ -64,6 +64,7 @@ export default function AddCustomModelModal({ isOpen, providerAlias, providerDis
           <div className="flex gap-2">
             <input
               type="text"
+              list={suggestedModels.length > 0 ? "available-model-ids" : undefined}
               value={modelId}
               onChange={(e) => { setModelId(e.target.value); setTestStatus(null); setTestError(""); }}
               onKeyDown={handleKeyDown}
@@ -71,6 +72,13 @@ export default function AddCustomModelModal({ isOpen, providerAlias, providerDis
               className="flex-1 px-3 py-2 text-sm border border-border rounded-lg bg-background focus:outline-none focus:border-primary"
               autoFocus
             />
+            {suggestedModels.length > 0 && (
+              <datalist id="available-model-ids">
+                {suggestedModels.map((model) => (
+                  <option key={model.id} value={model.id}>{model.name || model.id}</option>
+                ))}
+              </datalist>
+            )}
             <Button
               variant="secondary"
               icon="science"
@@ -82,7 +90,7 @@ export default function AddCustomModelModal({ isOpen, providerAlias, providerDis
             </Button>
           </div>
           <p className="text-xs text-text-muted mt-1">
-            Sent to provider as: <code className="font-mono bg-sidebar px-1 rounded">{stripAlias(modelId.trim()) || "model-id"}</code>
+            Sent to provider as: <code className="font-mono bg-sidebar px-1 rounded">{providerDisplayAlias}/{stripAlias(modelId.trim()) || "model-id"}</code>
           </p>
         </div>
 
@@ -120,6 +128,10 @@ AddCustomModelModal.propTypes = {
   isOpen: PropTypes.bool.isRequired,
   providerAlias: PropTypes.string.isRequired,
   providerDisplayAlias: PropTypes.string.isRequired,
+  suggestedModels: PropTypes.arrayOf(PropTypes.shape({
+    id: PropTypes.string.isRequired,
+    name: PropTypes.string,
+  })),
   onSave: PropTypes.func.isRequired,
   onClose: PropTypes.func.isRequired,
 };

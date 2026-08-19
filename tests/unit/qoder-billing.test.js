@@ -117,7 +117,7 @@ describe("wrapQoderSSE billing detection", () => {
     }
     buf += decoder.decode();
 
-    expect(buf).toContain("[qoder error 500");
+    expect(buf).toContain("qoder_upstream_error");
     expect(buf).toContain("data: [DONE]");
   });
 

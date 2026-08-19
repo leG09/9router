@@ -83,6 +83,11 @@ export default function ConnectionRow({ connection, proxyPools, isOAuth, isFirst
     : connection.name?.trim() && connection.displayName?.trim() && connection.name.trim() !== connection.displayName.trim()
       ? connection.displayName.trim()
       : null;
+  const isQoderWorkCn = connection.provider === "qoderwork-cn";
+  const qoderWorkAccountType = connection.providerSpecificData?.accountType === "enterprise"
+    || !!connection.providerSpecificData?.organizationId
+    ? "Enterprise"
+    : "Personal";
 
   // Use useState + useEffect for impure Date.now() to avoid calling during render
   const [isCooldown, setIsCooldown] = useState(false);
@@ -170,6 +175,15 @@ export default function ConnectionRow({ connection, proxyPools, isOAuth, isFirst
             <Badge variant="default" size="sm">
               {authLabel}
             </Badge>
+            {isQoderWorkCn && (
+              <Badge
+                variant={qoderWorkAccountType === "Enterprise" ? "primary" : "info"}
+                size="sm"
+                icon={qoderWorkAccountType === "Enterprise" ? "corporate_fare" : "person"}
+              >
+                {qoderWorkAccountType}
+              </Badge>
+            )}
             {hasAnyProxy && (
               <Badge variant={proxyBadgeVariant} size="sm">
                 Proxy
@@ -289,6 +303,15 @@ ConnectionRow.propTypes = {
     lastError: PropTypes.string,
     priority: PropTypes.number,
     globalPriority: PropTypes.number,
+    provider: PropTypes.string,
+    providerSpecificData: PropTypes.shape({
+      accountType: PropTypes.string,
+      organizationId: PropTypes.string,
+      proxyPoolId: PropTypes.string,
+      connectionProxyEnabled: PropTypes.bool,
+      connectionProxyUrl: PropTypes.string,
+      connectionNoProxy: PropTypes.string,
+    }),
   }).isRequired,
   proxyPools: PropTypes.arrayOf(PropTypes.shape({
     id: PropTypes.string,

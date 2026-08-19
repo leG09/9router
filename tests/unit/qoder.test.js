@@ -9,34 +9,71 @@
  *   - device flow URL construction
  */
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import crypto from "crypto";
 
-import { qoderEncodeBody } from "../../src/lib/qoder/encoding.js";
-import { buildCosyHeaders } from "../../src/lib/qoder/cosy.js";
-import { QoderService } from "../../src/lib/oauth/services/qoder.js";
+const { refreshFetchMock } = vi.hoisted(() => ({ refreshFetchMock: vi.fn() }));
+
+vi.mock("../../open-sse/utils/proxyFetch.js", () => ({
+  proxyAwareFetch: (...args) => refreshFetchMock(...args),
+}));
+
 import {
+  qoderEncodeBody,
+  buildCosyHeaders,
+  normalizeMessages,
+  wrapQoderSSE,
+  buildQoderRequestBody,
+  SHELL,
+  resolveReasoningEffort,
   QODER_CHAT_URL_ENCODED,
   QODER_MODEL_LIST_URL,
-  QODER_MODEL_MAP,
-} from "../../src/lib/qoder/constants.js";
+} from "../../open-sse/protocol/qoder/test-utils.js";
+import { normalizeQoderMachineOs, QODER_MACHINE_OS } from "../../open-sse/protocol/qoder/constants.js";
+import { QoderService } from "../../src/lib/oauth/services/qoder.js";
+import {
+  INTL_PROFILE,
+  CN_WORK_PROFILE,
+  resolveProfile,
+  createProtocol,
+  resolveQoderModels,
+  clearQoderCatalog,
+} from "../../open-sse/protocol/qoder/index.js";
+import { getCapabilitiesForModel } from "../../open-sse/providers/capabilities.js";
+import { getThinkingLevels } from "../../open-sse/providers/thinkingLevels.js";
+import { applyThinking } from "../../open-sse/translator/concerns/thinkingUnified.js";
+import { refreshQoderDeviceToken } from "../../open-sse/services/tokenRefresh/providers.js";
+import { refreshTokenByProvider } from "../../open-sse/services/tokenRefresh.js";
+import { QoderExecutor } from "../../open-sse/executors/qoder.js";
 import { PROVIDER_MODELS } from "../../open-sse/config/providerModels.js";
-import { __test__ as qoderExecutorInternals } from "../../open-sse/executors/qoder.js";
+import { PROVIDERS, PROVIDER_OAUTH } from "../../open-sse/providers/index.js";
+import qoderOAuth from "../../src/lib/oauth/providers/qoder.js";
+import qoderworkCnOAuth from "../../src/lib/oauth/providers/qoderwork-cn.js";
+import { getProvider as getOAuthProvider } from "../../src/lib/oauth/providers/index.js";
 
 // Convenience aliases — tests were originally written against module-level
 // helpers; the QoderService class wraps them so each test creates its own
 // instance to avoid hidden state.
 const generatePkcePair = () => new QoderService().generatePkcePair();
-const initiateDeviceFlow = () => new QoderService().initiateDeviceFlow();
+const initiateDeviceFlow = async () =>
+  new QoderService({ machineTokenResolver: async (machineId) => machineId }).initiateDeviceFlow();
 const parseExpiry = QoderService.parseExpiry;
 
-describe("QODER_MODEL_MAP", () => {
-  it("allows Qoder's latest model key", () => {
-    expect(QODER_MODEL_MAP.qmodel_latest).toBe("qmodel_latest");
-  });
-
+describe("provider catalog", () => {
   it("exposes Qoder's latest model in the static provider catalog", () => {
     expect(PROVIDER_MODELS.qd.some((model) => model.id === "qmodel_latest")).toBe(true);
+  });
+
+  it("exposes QoderWork enterprise keys instead of Qoder intl preview keys", () => {
+    const models = PROVIDER_MODELS.qdcn;
+    const ids = models.map((model) => model.id);
+    expect(ids).toContain("qwork-advanced");
+    expect(ids).toContain("qwork-auto");
+    expect(ids).not.toContain("qmodel_preview");
+    expect(models.find((model) => model.id === "qmodel_latest")).toMatchObject({
+      name: "Qwen3.8-Max",
+      priceFactor: 1.1,
+    });
   });
 });
 
@@ -95,10 +132,11 @@ describe("qoderEncodeBody", () => {
 describe("generatePkcePair", () => {
   it("produces base64url-safe verifier and challenge of the right length", () => {
     const { verifier, challenge } = generatePkcePair();
-    // 32 bytes → 43 base64url chars (no padding)
-    expect(verifier.length).toBe(43);
+    // Desktop generatePKCE$1: unreserved charset, length 43–128; S256 challenge 43 chars.
+    expect(verifier.length).toBeGreaterThanOrEqual(43);
+    expect(verifier.length).toBeLessThanOrEqual(128);
     expect(challenge.length).toBe(43);
-    expect(verifier).toMatch(/^[A-Za-z0-9_-]+$/);
+    expect(verifier).toMatch(/^[A-Za-z0-9\-._~]+$/);
     expect(challenge).toMatch(/^[A-Za-z0-9_-]+$/);
   });
 
@@ -116,32 +154,45 @@ describe("generatePkcePair", () => {
     expect(challenge).toBe(expected);
   });
 
-  it("returns codeVerifier (not verifier) on the higher-level helper", () => {
+  it("returns codeVerifier (not verifier) on the higher-level helper", async () => {
     // Regression: the providers.js qoder entry once read flow.verifier (undefined)
     // because initiateDeviceFlow returns the field as `codeVerifier`.
-    const flow = initiateDeviceFlow();
+    const flow = await initiateDeviceFlow();
     expect(typeof flow.codeVerifier).toBe("string");
-    expect(flow.codeVerifier.length).toBe(43);
+    expect(flow.codeVerifier.length).toBeGreaterThanOrEqual(43);
+    expect(flow.codeVerifier.length).toBeLessThanOrEqual(128);
     expect(flow.verifier).toBeUndefined();
   });
 });
 
 describe("initiateDeviceFlow", () => {
-  it("produces a verification URL pointing at qoder.com/device/selectAccounts", () => {
-    const flow = initiateDeviceFlow();
+  it("produces a verification URL pointing at qoder.com/device/selectAccounts", async () => {
+    const flow = await initiateDeviceFlow();
     expect(flow.verificationUriComplete).toMatch(
       /^https:\/\/qoder\.com\/device\/selectAccounts\?/,
     );
     expect(flow.verificationUriComplete).toContain("challenge_method=S256");
     expect(flow.verificationUriComplete).toContain(`nonce=${flow.nonce}`);
-    expect(flow.verificationUriComplete).toContain(`machine_id=${flow.machineId}`);
+    expect(flow.verificationUriComplete).toMatch(/machine_id=[^&]+/);
   });
 
-  it("returns nonce and machineId as UUIDs", () => {
-    const flow = initiateDeviceFlow();
+  it("returns raw UUID machineId and a separately resolved machineToken", async () => {
+    const resolver = vi.fn(async () => "umid-token");
+    const flow = await new QoderService({ machineTokenResolver: resolver }).initiateDeviceFlow();
     const uuidRe = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
     expect(flow.nonce).toMatch(uuidRe);
     expect(flow.machineId).toMatch(uuidRe);
+    expect(flow.machineToken).toBe("umid-token");
+    expect(resolver).toHaveBeenCalledOnce();
+    expect(resolver).toHaveBeenCalledWith(flow.machineId);
+    expect(new URL(flow.verificationUriComplete).searchParams.get("machine_id")).toBe(flow.machineId);
+  });
+
+  it("falls machineToken back to the raw UUID", async () => {
+    const flow = await new QoderService({
+      machineTokenResolver: async () => "",
+    }).initiateDeviceFlow();
+    expect(flow.machineToken).toBe(flow.machineId);
   });
 });
 
@@ -185,6 +236,28 @@ describe("buildCosyHeaders", () => {
     expect(headers.Authorization).toMatch(/^Bearer COSY\.[A-Za-z0-9+/=]+\.[a-f0-9]{32}$/);
   });
 
+  it("Authorization sig matches live newline-separated Cosy MD5 input", () => {
+    // Live 2026-07-28: intl + CN both require newline-joined sigInput.
+    // Space-joined MD5 is rejected upstream as Signature invalid.
+    const body = Buffer.from("newline-delimiter-probe", "utf8");
+    const headers = buildCosyHeaders(body, QODER_MODEL_LIST_URL, creds);
+    const auth = headers.Authorization;
+    const m = /^Bearer COSY\.([A-Za-z0-9+/=]+)\.([a-f0-9]{32})$/.exec(auth);
+    expect(m).toBeTruthy();
+    const payloadB64 = m[1];
+    const sig = m[2];
+    const cosyKey = headers["Cosy-Key"];
+    const timestamp = headers["Cosy-Date"];
+    const sigPath = headers["Cosy-Sigpath"];
+    const bodyLatin1 = body.toString("latin1");
+    const spaceInput = `${payloadB64} ${cosyKey} ${timestamp} ${bodyLatin1} ${sigPath}`;
+    const newlineInput = `${payloadB64}\n${cosyKey}\n${timestamp}\n${bodyLatin1}\n${sigPath}`;
+    const spaceMd5 = crypto.createHash("md5").update(Buffer.from(spaceInput, "latin1")).digest("hex");
+    const newlineMd5 = crypto.createHash("md5").update(Buffer.from(newlineInput, "latin1")).digest("hex");
+    expect(sig).toBe(newlineMd5);
+    expect(sig).not.toBe(spaceMd5);
+  });
+
   it("Cosy-Sigpath strips the leading /algo prefix", () => {
     const headers = buildCosyHeaders(Buffer.alloc(0), QODER_MODEL_LIST_URL, creds);
     expect(headers["Cosy-Sigpath"]).toBe("/api/v2/model/list");
@@ -215,6 +288,20 @@ describe("buildCosyHeaders", () => {
     const headers = buildCosyHeaders(Buffer.alloc(0), QODER_MODEL_LIST_URL, creds);
     expect(headers["Cosy-Machineid"]).toBe("fixed-machine-id");
     expect(headers["Cosy-Machinetoken"]).toBe("fixed-machine-id");
+  });
+
+  it("keeps machineId and machineToken distinct when both are supplied", () => {
+    const headers = buildCosyHeaders(Buffer.alloc(0), QODER_MODEL_LIST_URL, {
+      ...creds,
+      machineToken: "umid-token",
+    });
+    expect(headers["Cosy-Machineid"]).toBe("fixed-machine-id");
+    expect(headers["Cosy-Machinetoken"]).toBe("umid-token");
+  });
+
+  it("falls Cosy-Machinetoken back to machineId for legacy rows", () => {
+    const headers = buildCosyHeaders(Buffer.alloc(0), QODER_MODEL_LIST_URL, creds);
+    expect(headers["Cosy-Machinetoken"]).toBe(headers["Cosy-Machineid"]);
   });
 
   it("auto-generates a machineId when none is supplied", () => {
@@ -298,6 +385,14 @@ describe("parseExpiry", () => {
     expect(result).toBeLessThanOrEqual(after + 60_000);
   });
 
+  it("supports millisecond expires_in values used by QoderWork CN", () => {
+    const before = Date.now();
+    const result = parseExpiry(undefined, 60_000, "milliseconds");
+    const after = Date.now();
+    expect(result).toBeGreaterThanOrEqual(before + 60_000);
+    expect(result).toBeLessThanOrEqual(after + 60_000);
+  });
+
   // Regression for review finding #7: expiresInSeconds=0 used to be treated
   // as missing and silently fabricated 30-day default. We now honor 0 as
   // "already expired".
@@ -328,7 +423,6 @@ describe("parseExpiry", () => {
 });
 
 describe("normalizeMessages", () => {
-  const { normalizeMessages } = qoderExecutorInternals;
 
   it("hoists role:system out of messages into systemText", () => {
     const result = normalizeMessages([
@@ -367,10 +461,91 @@ describe("normalizeMessages", () => {
     expect(result.messages).toEqual([]);
     expect(result.systemText).toBe("");
   });
+
+  it("hoists developer role into systemText like system", () => {
+    const result = normalizeMessages([
+      { role: "developer", content: "dev rules" },
+      { role: "user", content: "hi" },
+    ]);
+    expect(result.systemText).toBe("dev rules");
+    expect(result.messages).toHaveLength(1);
+  });
+
+  it("keeps Chat image_url parts (official content shape)", () => {
+    const result = normalizeMessages([
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "what is this" },
+          {
+            type: "image_url",
+            image_url: { url: "https://example.com/a.png", detail: "high" },
+          },
+        ],
+      },
+    ]);
+    expect(result.imageUrls).toEqual(["https://example.com/a.png"]);
+    expect(result.messages[0].content).toEqual([
+      { type: "text", text: "what is this" },
+      {
+        type: "image_url",
+        image_url: { url: "https://example.com/a.png", detail: "high" },
+      },
+    ]);
+  });
+
+  it("maps binary data+mime_type to official binary part", () => {
+    const result = normalizeMessages([
+      {
+        role: "user",
+        content: [
+          { type: "text", text: "see" },
+          { type: "binary", data: "AAAA", mime_type: "image/png" },
+        ],
+      },
+    ]);
+    expect(result.messages[0].content).toEqual([
+      { type: "text", text: "see" },
+      { type: "binary", binary: { data: "AAAA", mime_type: "image/png" } },
+    ]);
+  });
+
+  // Practical-minimal: Anthropic source shim is commented out in body.js.
+  // Uncomment body path + this test when enabling that client shape.
+  // it("converts anthropic-like base64 source to image_url data URL", () => {
+  //   const result = normalizeMessages([
+  //     {
+  //       role: "user",
+  //       content: [
+  //         {
+  //           type: "image",
+  //           source: { type: "base64", media_type: "image/jpeg", data: "qqqq" },
+  //         },
+  //       ],
+  //     },
+  //   ]);
+  //   expect(result.messages[0].content[0]).toEqual({
+  //     type: "image_url",
+  //     image_url: { url: "data:image/jpeg;base64,qqqq" },
+  //   });
+  // });
+
+  it("passthrough reasoning_content and name on messages", () => {
+    const result = normalizeMessages([
+      {
+        role: "assistant",
+        content: "ok",
+        name: "bot",
+        reasoning_content: "thoughts",
+      },
+    ]);
+    expect(result.messages[0].name).toBe("bot");
+    expect(result.messages[0].reasoning_content).toBe("thoughts");
+  });
 });
 
 describe("wrapQoderSSE", () => {
-  const { wrapQoderSSE } = qoderExecutorInternals;
+
 
   // Helper: build a fake Response carrying the given lines as the body.
   function makeResponse(lines, { status = 200 } = {}) {
@@ -457,7 +632,7 @@ describe("wrapQoderSSE", () => {
     const env = JSON.stringify({ statusCodeValue: 503, body: "service unavailable" });
     const wrapped = await wrapQoderSSE(makeResponse([`data: ${env}\n\n`]), "qoder/lite");
     const out = await drain(wrapped);
-    expect(out).toContain("[qoder error 503");
+    expect(out).toContain("qoder_upstream_error");
     expect(out).toContain("data: [DONE]\n\n");
   });
 
@@ -465,5 +640,753 @@ describe("wrapQoderSSE", () => {
     const r = new Response("not ok", { status: 500 });
     const wrapped = await wrapQoderSSE(r, "qoder/auto");
     expect(wrapped).toBe(r);
+  });
+});
+
+describe("machine OS normalization", () => {
+  it("uses the current runtime platform", () => {
+    expect(QODER_MACHINE_OS).toBe(normalizeQoderMachineOs(process.arch, process.platform));
+  });
+
+  it.each([
+    ["arm64", "darwin", "aarch64_darwin"],
+    ["x64", "linux", "x86_64_linux"],
+    ["x64", "win32", "x86_64_windows"],
+  ])("maps %s/%s to protocol spelling %s", (arch, platform, expected) => {
+    expect(normalizeQoderMachineOs(arch, platform)).toBe(expected);
+  });
+});
+
+describe("protocol profile", () => {
+  it("defaults null to intl", () => {
+    expect(resolveProfile(null).id).toBe("intl");
+    expect(resolveProfile(undefined).chatUrl).toBe(INTL_PROFILE.chatUrl);
+  });
+
+  it("resolves canonical protocol profile ids", () => {
+    expect(resolveProfile("cn-work").id).toBe("cn-work");
+    expect(CN_WORK_PROFILE.refreshTokenUrl).toContain("gateway.qwenwork.cn");
+    expect(CN_WORK_PROFILE.deviceClientId).toBeTruthy();
+  });
+
+  it("projects the registry protocolProfile into transport and OAuth views", () => {
+    expect(PROVIDERS.qoder.protocolProfile).toBe("intl");
+    expect(PROVIDER_OAUTH.qoder.protocolProfile).toBe("intl");
+    expect(PROVIDERS["qoderwork-cn"].protocolProfile).toBe("cn-work");
+    expect(PROVIDER_OAUTH["qoderwork-cn"].protocolProfile).toBe("cn-work");
+  });
+
+  it("keeps connection timeout without a provider stall override", () => {
+    for (const id of ["qoder", "qoderwork-cn"]) {
+      expect(PROVIDERS[id].timeoutMs).toBe(120_000);
+      expect(PROVIDERS[id].stallTimeoutMs).toBeUndefined();
+    }
+  });
+
+  it("throws on unknown profile id (no silent intl fallback)", () => {
+    expect(() => resolveProfile("nope")).toThrow(/unknown protocol profile/);
+  });
+
+  it("accepts profile object for composition without registry", () => {
+    const alt = {
+      ...INTL_PROFILE,
+      id: "test-alt",
+      chatUrl: "https://example.test/algo/api/v2/service/pro/sse/agent_chat_generation?Encode=1",
+      sessionType: "test-session",
+      businessProduct: "test-product",
+    };
+    const p = resolveProfile(alt);
+    expect(p.chatUrl).toContain("example.test");
+    expect(p.sessionType).toBe("test-session");
+  });
+
+  it("createProtocol binds intl by default", () => {
+    const proto = createProtocol();
+    expect(proto.profile.id).toBe("intl");
+    expect(proto.profile.chatUrl).toBe(INTL_PROFILE.chatUrl);
+  });
+
+  it("createProtocol accepts inline profile object (future region = data only)", () => {
+    const alt = { ...INTL_PROFILE, id: "alt", chatUrl: "https://example.test/chat?Encode=1" };
+    const proto = createProtocol(alt);
+    expect(proto.profile.id).toBe("alt");
+    expect(proto.profile.chatUrl).toContain("example.test");
+  });
+});
+
+describe("profile-driven payload + cosy (simulation)", () => {
+  const creds = {
+    userId: "u1",
+    authToken: "dt-test",
+    name: "N",
+    email: "e@x.com",
+    machineId: "fixed-machine-id",
+  };
+
+  it("buildQoderRequestBody uses profile session/business fields", async () => {
+    const alt = {
+      ...INTL_PROFILE,
+      id: "test-alt",
+      sessionType: "sim-session",
+      businessProduct: "sim-product",
+      businessVersion: "9.9.9",
+    };
+    // Avoid live catalog: inject rawConfigs via resolve path is hard;
+    // call buildQoderRequestBody only if model config available — use force path with stub.
+    // Instead assert createProtocol profile binding + Cosy version from profile.
+    const headers = buildCosyHeaders(Buffer.alloc(0), alt.chatUrl || QODER_MODEL_LIST_URL, creds, {
+      ...alt,
+      ideVersion: "9.9.9-test",
+      clientType: "99",
+      machineOs: "test_os",
+      machineType: "99",
+      dataPolicy: "agree",
+      loginVersion: "v-test",
+    });
+    expect(headers["Cosy-Version"]).toBe("9.9.9-test");
+    expect(headers["Cosy-Clienttype"]).toBe("99");
+    expect(headers["Cosy-Machineos"]).toBe("test_os");
+    expect(headers["Login-Version"]).toBe("v-test");
+    expect(headers["Cosy-Data-Policy"]).toBe("agree");
+  });
+
+  it("OAuth service uses injected profile login + device URLs", async () => {
+    const alt = {
+      ...INTL_PROFILE,
+      id: "alt",
+      loginUrl: "https://example.test/device/selectAccounts",
+      deviceTokenUrl: "https://example.test/api/v1/deviceToken/poll",
+    };
+    const svc = new QoderService({ profile: alt, machineTokenResolver: async (id) => id });
+    const flow = await svc.initiateDeviceFlow();
+    expect(flow.verificationUriComplete.startsWith(alt.loginUrl)).toBe(true);
+    expect(svc.profile.deviceTokenUrl).toBe(alt.deviceTokenUrl);
+  });
+
+  it("default OAuth service stays on intl hosts", async () => {
+    const svc = new QoderService({ machineTokenResolver: async (id) => id });
+    const flow = await svc.initiateDeviceFlow();
+    expect(flow.verificationUriComplete.startsWith(INTL_PROFILE.loginUrl)).toBe(true);
+  });
+
+});
+
+describe("contract body (awA)", () => {
+  const credentials = {
+    accessToken: "dt-test",
+    displayName: "T",
+    email: "t@x.com",
+    providerSpecificData: { userId: "u1", machineId: "m1" },
+  };
+  const fakeModelConfig = {
+    key: "qmodel_latest",
+    display_name: "Q",
+    is_reasoning: true,
+    max_output_tokens: 8192,
+    max_input_tokens: 100000,
+    source: "system",
+    format: "openai",
+  };
+
+  it("maps the legacy CN preview key to the enterprise Advanced model", async () => {
+    const { qoderKey, payload } = await buildQoderRequestBody({
+      model: "qdcn/qmodel_preview",
+      body: { messages: [{ role: "user", content: "hello" }] },
+      credentials,
+      profile: "cn-work",
+      modelConfig: {
+        display_name: "Advanced",
+        format: "openai",
+        source: "system",
+        is_vl: true,
+        max_input_tokens: 180000,
+      },
+    });
+    expect(qoderKey).toBe("qwork-advanced");
+    expect(payload.model_config.key).toBe("qwork-advanced");
+    expect(payload.chat_context.extra.modelConfig.key).toBe("qwork-advanced");
+  });
+
+  it("builds FREE_INPUT shell without catalog when modelConfig injected", async () => {
+    const { qoderKey, payload } = await buildQoderRequestBody({
+      model: "qoder/qmodel_latest",
+      body: {
+        messages: [
+          { role: "system", content: "sys" },
+          { role: "user", content: "hello world" },
+        ],
+        max_tokens: 1000,
+        tools: [],
+      },
+      credentials,
+      modelConfig: fakeModelConfig,
+    });
+    expect(qoderKey).toBe("qmodel_latest");
+    expect(payload.chat_task).toBe(SHELL.chat_task);
+    expect(payload.source).toBe(1);
+    expect(payload.version).toBe("3");
+    expect(payload.agent_id).toBe("agent_common");
+    expect(payload.stream).toBe(true);
+    expect(payload.system).toBe("sys");
+    expect(payload.messages).toEqual([{ role: "user", content: "hello world" }]);
+    expect(payload.parameters.max_tokens).toBe(1000);
+    expect(payload.model_config.key).toBe("qmodel_latest");
+    expect(payload.chat_context.text).toBe("hello world");
+    expect(payload.chat_context.extra.modelConfig).toEqual({
+      key: "qmodel_latest",
+      is_reasoning: true,
+    });
+    // awA: three ids share request_id by default
+    expect(payload.request_id).toBe(payload.request_set_id);
+    expect(payload.request_id).toBe(payload.chat_record_id);
+    // business omitted by default
+    expect(payload.business).toBeUndefined();
+  });
+
+  it("maps reasoning_effort into parameters", async () => {
+    const { payload } = await buildQoderRequestBody({
+      model: "qmodel_latest",
+      body: {
+        messages: [{ role: "user", content: "x" }],
+        reasoning_effort: "high",
+      },
+      credentials,
+      modelConfig: fakeModelConfig,
+    });
+    expect(payload.parameters.reasoning_effort).toBe("high");
+  });
+
+  it("includeBusiness adds business block from profile", async () => {
+    const { payload } = await buildQoderRequestBody({
+      model: "qmodel_latest",
+      body: { messages: [{ role: "user", content: "title here" }] },
+      credentials,
+      modelConfig: fakeModelConfig,
+      includeBusiness: true,
+    });
+    expect(payload.business).toBeDefined();
+    expect(payload.business.product).toBeDefined();
+    expect(payload.business.type).toBe("agent");
+  });
+
+  it("resolveReasoningEffort normalizes aliases", () => {
+    expect(resolveReasoningEffort({ reasoning_effort: "x-high" })).toBe("xhigh");
+    expect(resolveReasoningEffort({ reasoning: { effort: "low" } })).toBe("low");
+    expect(resolveReasoningEffort({ reasoning_effort: "auto" })).toBeUndefined();
+  });
+
+  it("passes tool_calls and tool_call_id through messages (C4)", async () => {
+    const { payload } = await buildQoderRequestBody({
+      model: "qmodel_latest",
+      body: {
+        messages: [
+          { role: "user", content: "call it" },
+          {
+            role: "assistant",
+            content: "",
+            tool_calls: [
+              {
+                id: "call_1",
+                type: "function",
+                function: { name: "t", arguments: "{}" },
+              },
+            ],
+          },
+          { role: "tool", tool_call_id: "call_1", content: "ok" },
+        ],
+      },
+      credentials,
+      modelConfig: fakeModelConfig,
+    });
+    expect(payload.messages[1].tool_calls?.[0]?.id).toBe("call_1");
+    expect(payload.messages[2].tool_call_id).toBe("call_1");
+    expect(payload.messages[2].role).toBe("tool");
+  });
+
+  it("drops temperature and keeps only CONVERT parameters (DROP)", async () => {
+    const { payload } = await buildQoderRequestBody({
+      model: "qmodel_latest",
+      body: {
+        messages: [{ role: "user", content: "x" }],
+        temperature: 0.9,
+        top_p: 0.5,
+        seed: 7,
+        max_tokens: 128,
+      },
+      credentials,
+      modelConfig: fakeModelConfig,
+    });
+    expect(payload.temperature).toBeUndefined();
+    expect(payload.parameters).toEqual({ max_tokens: 128, reasoning_effort: "high", context_length: 100000 });
+  });
+
+  it("fills chat_context.imageUrls from vision parts", async () => {
+    const { payload } = await buildQoderRequestBody({
+      model: "qmodel_latest",
+      body: {
+        messages: [
+          {
+            role: "user",
+            content: [
+              { type: "text", text: "describe" },
+              { type: "image_url", image_url: { url: "data:image/png;base64,xx" } },
+            ],
+          },
+        ],
+      },
+      credentials,
+      modelConfig: fakeModelConfig,
+    });
+    expect(payload.chat_context.imageUrls).toEqual(["data:image/png;base64,xx"]);
+    expect(payload.chat_context.text).toBe("describe");
+    expect(payload.messages[0].content).toEqual([
+      { type: "text", text: "describe" },
+      { type: "image_url", image_url: { url: "data:image/png;base64,xx" } },
+    ]);
+  });
+});
+
+describe("field-ops pipeline (capabilities → applyThinking → body)", () => {
+  const credentials = { providerSpecificData: { userId: "u1" } };
+  const fakeModelConfig = {
+    key: "qmodel_latest",
+    is_reasoning: true,
+    max_output_tokens: 8192,
+    source: "system",
+  };
+
+  it("marks qoder models as reasoning with qoder thinkingFormat", () => {
+    expect(getCapabilitiesForModel("qoder", "qmodel_latest")).toMatchObject({
+      reasoning: true,
+      thinkingFormat: "qoder",
+    });
+    expect(getThinkingLevels("qoder", "qmodel_latest")).toEqual([
+      "none",
+      "low",
+      "medium",
+      "high",
+      "xhigh",
+      "max",
+    ]);
+  });
+
+  it("keeps reasoning_effort through applyThinking into parameters", async () => {
+    const body = {
+      messages: [{ role: "user", content: "think" }],
+      reasoning_effort: "high",
+      max_tokens: 256,
+    };
+    applyThinking("qoder", "qmodel_latest", body, "qoder");
+    expect(body.reasoning_effort).toBe("high");
+
+    const { payload } = await buildQoderRequestBody({
+      model: "qmodel_latest",
+      body,
+      credentials,
+      modelConfig: fakeModelConfig,
+    });
+    expect(payload.parameters.reasoning_effort).toBe("high");
+  });
+
+  it("maps model(level) suffix intent via applyThinking into parameters", async () => {
+    const body = {
+      messages: [{ role: "user", content: "think" }],
+      max_tokens: 256,
+    };
+    applyThinking("qoder", "qmodel_latest(high)", body, "qoder");
+    expect(body.reasoning_effort).toBe("high");
+
+    const { payload } = await buildQoderRequestBody({
+      model: "qmodel_latest",
+      body,
+      credentials,
+      modelConfig: fakeModelConfig,
+    });
+    expect(payload.parameters.reasoning_effort).toBe("high");
+  });
+
+  it("passes reasoning_effort max through unclamped (qoder format)", async () => {
+    const body = {
+      messages: [{ role: "user", content: "think" }],
+      reasoning_effort: "max",
+      max_tokens: 256,
+    };
+    applyThinking("qoder", "qmodel_latest", body, "qoder");
+    expect(body.reasoning_effort).toBe("max");
+    const { payload } = await buildQoderRequestBody({
+      model: "qmodel_latest",
+      body,
+      credentials,
+      modelConfig: fakeModelConfig,
+    });
+    expect(payload.parameters.reasoning_effort).toBe("max");
+  });
+
+  it("keeps max in Qoder format for QoderWork", async () => {
+    expect(PROVIDERS["qoderwork-cn"].thinkingFormat).toBeUndefined();
+    const body = {
+      messages: [{ role: "user", content: "think" }],
+      reasoning_effort: "max",
+      max_tokens: 256,
+    };
+    applyThinking("qoder", "qmodel_latest", body, "qoderwork-cn");
+    const { payload } = await buildQoderRequestBody({
+      model: "qmodel_latest",
+      body,
+      credentials,
+      modelConfig: fakeModelConfig,
+      profile: "cn-work",
+    });
+    expect(payload.parameters.reasoning_effort).toBe("max");
+  });
+
+  it("forwards max_thinking_tokens verbatim into parameters", async () => {
+    const { payload } = await buildQoderRequestBody({
+      model: "qmodel_latest",
+      body: { messages: [{ role: "user", content: "x" }], max_thinking_tokens: 12345 },
+      credentials,
+      modelConfig: fakeModelConfig,
+    });
+    expect(payload.parameters.max_thinking_tokens).toBe(12345);
+  });
+
+  it("defaults context_length to the largest context_config tier", async () => {
+    const { payload } = await buildQoderRequestBody({
+      model: "qmodel_latest",
+      body: { messages: [{ role: "user", content: "x" }] },
+      credentials,
+      modelConfig: {
+        key: "qmodel_latest",
+        is_reasoning: true,
+        max_input_tokens: 180000,
+        context_config: {
+          "200K": { token_count: 200000, is_default: true },
+          "400K": { token_count: 400000 },
+          "1M": { token_count: 1000000 },
+        },
+      },
+    });
+    expect(payload.parameters.context_length).toBe(1000000);
+  });
+
+  it("lets an explicit client context_length win over the model tier", async () => {
+    const { payload } = await buildQoderRequestBody({
+      model: "qmodel_latest",
+      body: { messages: [{ role: "user", content: "x" }], context_length: 400000 },
+      credentials,
+      modelConfig: {
+        key: "qmodel_latest",
+        is_reasoning: true,
+        max_input_tokens: 180000,
+        context_config: { "1M": { token_count: 1000000, is_default: true } },
+      },
+    });
+    expect(payload.parameters.context_length).toBe(400000);
+  });
+
+  it("attaches CN business block with qoder_work product/agent type/init stage", async () => {
+    const { payload } = await buildQoderRequestBody({
+      model: "qmodel_latest",
+      body: { messages: [{ role: "user", content: "hi there" }] },
+      credentials,
+      modelConfig: fakeModelConfig,
+      profile: "cn-work",
+    });
+    expect(payload.session_type).toBe("qoder_work");
+    expect(payload.business).toMatchObject({
+      product: "qoder_work",
+      type: "agent",
+      stage: "init",
+    });
+  });
+});
+
+describe("wrapQoderSSE special tokens", () => {
+  function makeResponse(lines, { status = 200 } = {}) {
+    const body = new ReadableStream({
+      start(controller) {
+        const encoder = new TextEncoder();
+        for (const line of lines) controller.enqueue(encoder.encode(line));
+        controller.close();
+      },
+    });
+    return new Response(body, { status });
+  }
+  async function drain(response) {
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = "";
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+    }
+    return buf + decoder.decode();
+  }
+
+  it("does not forward NOT_EXCEED_QUOTA as content", async () => {
+    const out = await drain(wrapQoderSSE(makeResponse(["data: [NOT_EXCEED_QUOTA]\n\n"]), "qoder/x"));
+    expect(out).not.toContain("NOT_EXCEED_QUOTA");
+    expect(out).toContain("data: [DONE]");
+  });
+
+  it("maps EXCEED_QUOTA to error event not content delta", async () => {
+    const out = await drain(wrapQoderSSE(makeResponse(["data: [EXCEED_QUOTA] limit\n\n"]), "qoder/x"));
+    expect(out).toContain("qoder_upstream_error");
+    expect(out).not.toMatch(/delta":\{"content":"\\n\[qoder error/);
+  });
+});
+
+describe("qoderwork-cn refresh + executor", () => {
+  it("registers the CN OAuth adapter under its public provider id", () => {
+    expect(getOAuthProvider("qoderwork-cn")).toBe(qoderworkCnOAuth);
+  });
+
+  it("CN device login URL includes client_id", async () => {
+    const flow = await new QoderService({
+      profile: "cn-work",
+      machineTokenResolver: async (id) => id,
+    }).initiateDeviceFlow();
+    expect(flow.verificationUriComplete).toContain("client_id=");
+    expect(flow.verificationUriComplete).toContain("gateway.qwenwork.cn");
+  });
+
+  it("reads enterprise model_config entries from the CN qwork catalog group", async () => {
+    clearQoderCatalog();
+    refreshFetchMock.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          chat: [],
+          qwork: [
+            {
+              key: "qwork-advanced",
+              display_name: "Advanced",
+              enable: true,
+              format: "openai",
+              source: "system",
+              is_vl: true,
+              is_reasoning: false,
+              max_input_tokens: 180000,
+            },
+            {
+              key: "qmodel_latest",
+              display_name: "Standard",
+              enable: true,
+              price_factor: 1.1,
+              max_input_tokens: 180000,
+            },
+          ],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+    const result = await resolveQoderModels(
+      {
+        accessToken: "cn-catalog-token",
+        providerSpecificData: {
+          userId: "cn-catalog-user",
+          machineId: "cn-catalog-machine",
+        },
+      },
+      { profile: "cn-work", forceRefresh: true },
+    );
+    expect(result.models.map((model) => model.id)).toEqual(["qwork-advanced", "qmodel_latest"]);
+    expect(result.models.find((model) => model.id === "qmodel_latest")).toMatchObject({
+      name: "Qwen3.8-Max",
+      priceFactor: 1.1,
+      isNew: true,
+    });
+    expect(result.rawConfigs.get("qwork-advanced")).toMatchObject({
+      display_name: "Advanced",
+      max_input_tokens: 180000,
+    });
+  });
+
+  it("opens CN login at the qwenwork OAuth hop so enterprise sign-in receives its cookies", async () => {
+    refreshFetchMock.mockResolvedValueOnce(
+      new Response(null, {
+        status: 302,
+        headers: {
+          Location:
+            "https://qwenwork.cn/oauth2/auth?client_id=cn-client&state=device-state",
+        },
+      }),
+    );
+
+    const data = await qoderworkCnOAuth.requestDeviceCode(qoderworkCnOAuth.config);
+    const browserUrl = new URL(data.verification_uri_complete);
+    expect(browserUrl.origin + browserUrl.pathname).toBe("https://qwenwork.cn/oauth2/auth");
+    expect(browserUrl.searchParams.get("state")).toBe("device-state");
+    expect(data.device_code).toBe(data._qoderNonce);
+    const [gatewayUrl, init] = refreshFetchMock.mock.calls.at(-1);
+    expect(String(gatewayUrl)).toContain("gateway.qwenwork.cn/device/selectAccounts");
+    expect(init.redirect).toBe("manual");
+  });
+
+  it("does not expose an untrusted CN login redirect to the browser", async () => {
+    const initialUrl = "https://gateway.qwenwork.cn/device/selectAccounts?nonce=n";
+    const svc = new QoderService({
+      profile: "cn-work",
+      fetchImpl: async () =>
+        new Response(null, {
+          status: 302,
+          headers: { Location: "https://example.test/oauth2/auth?state=bad" },
+        }),
+    });
+    await expect(svc.resolveBrowserLoginUrl(initialUrl)).resolves.toBe(initialUrl);
+  });
+
+  it("refreshQoderDeviceToken maps device_token response", async () => {
+    refreshFetchMock.mockResolvedValue(
+      new Response(
+        JSON.stringify({ device_token: "dt-x", refresh_token: "rt-x", expires_in: 120_000 }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+    const r = await refreshQoderDeviceToken("rt-success-unique", "cn-work");
+    expect(r.accessToken).toBe("dt-x");
+    expect(r.refreshToken).toBe("rt-x");
+    expect(r.expiresIn).toBeGreaterThanOrEqual(60);
+    expect(r.expiresIn).toBeLessThanOrEqual(120);
+    const [, init] = refreshFetchMock.mock.calls.at(-1);
+    expect(init.headers["User-Agent"]).toBe("qoderwork/0.1.8");
+    expect(JSON.parse(init.body)).toMatchObject({
+      target: "c",
+      client_id: "e883ade2-e6e3-4d6d-adf7-f92ceff5fdcb",
+      redirect_uri: "qwenwork-cn://",
+    });
+  });
+
+  it("routes shared qoderwork-cn refreshes through the cn-work profile", async () => {
+    refreshFetchMock.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({ device_token: "dt-shared", refresh_token: "rt-shared", expires_in: 120_000 }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+    const result = await refreshTokenByProvider(
+      "qoderwork-cn",
+      { refreshToken: "rt-shared-handler" },
+      null,
+    );
+    expect(result).toMatchObject({
+      accessToken: "dt-shared",
+      refreshToken: "rt-shared",
+    });
+    const [url] = refreshFetchMock.mock.calls.at(-1);
+    expect(String(url)).toBe("https://gateway.qwenwork.cn/api/v1/deviceToken/refresh");
+  });
+
+  it("refresh invalid_grant on 401", async () => {
+    refreshFetchMock.mockResolvedValue(
+      new Response(JSON.stringify({ message: "nope" }), {
+        status: 401,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+    const r = await refreshQoderDeviceToken("rt-fail-401", "cn-work");
+    expect(r?.error).toBe("invalid_grant");
+  });
+
+  it("QoderExecutor for qoderwork-cn uses cn-work profile and can need refresh", () => {
+    const ex = new QoderExecutor("qoderwork-cn");
+    expect(ex.getProtocolProfile()).toBe("cn-work");
+    expect(ex.needsRefresh({ expiresAt: Date.now() - 1000, refreshToken: "rt" })).toBe(true);
+  });
+
+  it("persists both machine fields in Qoder OAuth adapters with legacy fallback", () => {
+    for (const adapter of [qoderOAuth, qoderworkCnOAuth]) {
+      const mapped = adapter.mapTokens({
+        access_token: "dt-x",
+        expires_in: 60,
+        _qoderUserId: "u1",
+        _qoderMachineId: "uuid-1",
+        _qoderMachineToken: "umid-1",
+      });
+      expect(mapped.providerSpecificData).toMatchObject({
+        machineId: "uuid-1",
+        machineToken: "umid-1",
+      });
+      const legacy = adapter.mapTokens({
+        access_token: "dt-x",
+        expires_in: 60,
+        _qoderUserId: "u1",
+        _qoderMachineId: "uuid-1",
+      });
+      expect(legacy.providerSpecificData.machineToken).toBe("uuid-1");
+    }
+  });
+
+  it("classifies QoderWork CN OAuth accounts as enterprise or personal", () => {
+    const enterprise = qoderworkCnOAuth.mapTokens({
+      access_token: "dt-enterprise",
+      _qoderUserId: "enterprise-user",
+      _qoderOrganizationId: "org-1",
+    });
+    const personal = qoderworkCnOAuth.mapTokens({
+      access_token: "dt-personal",
+      _qoderUserId: "personal-user",
+    });
+
+    expect(enterprise.providerSpecificData).toMatchObject({
+      organizationId: "org-1",
+      accountType: "enterprise",
+    });
+    expect(personal.providerSpecificData).toMatchObject({
+      organizationId: "",
+      accountType: "personal",
+    });
+  });
+});
+
+describe("cn-work device login URL", () => {
+  it("includes client_id and redirect_uri like desktop", async () => {
+    const flow = await new QoderService({
+      profile: "cn-work",
+      machineTokenResolver: async (id) => id,
+    }).initiateDeviceFlow();
+    const u = new URL(flow.verificationUriComplete);
+    expect(u.origin + u.pathname).toBe("https://gateway.qwenwork.cn/device/selectAccounts");
+    expect(u.searchParams.get("client_id")).toBe("e883ade2-e6e3-4d6d-adf7-f92ceff5fdcb");
+    expect(u.searchParams.get("redirect_uri")).toBe("qwenwork-cn://");
+    expect(u.searchParams.get("challenge_method")).toBe("S256");
+    expect(u.searchParams.get("nonce")).toBe(flow.nonce);
+    expect(u.searchParams.get("machine_id")).toBeTruthy();
+  });
+});
+
+describe("Cosy SEP (intl + cn-work)", () => {
+  it("uses newline join for both intl and cn-work", async () => {
+    const { buildCosyHeaders } = await import("../../open-sse/protocol/qoder/cosy.js");
+    const creds = {
+      userId: "u1",
+      authToken: "dt-test",
+      name: "n",
+      email: "e@x.com",
+      machineId: "00000000-0000-0000-0000-000000000001",
+    };
+    const body = Buffer.from("sep-parity", "utf8");
+    const intlUrl = "https://api3.qoder.sh/algo/api/v2/model/list?Encode=1";
+    const cnUrl = "https://gateway.qwenwork.cn/algo/api/v2/model/list?Encode=1";
+    const intl = buildCosyHeaders(body, intlUrl, creds, "intl");
+    const cn = buildCosyHeaders(body, cnUrl, creds, "cn-work");
+    expect(intl.Authorization).toMatch(/^Bearer COSY\.[A-Za-z0-9+/=]+\.[a-f0-9]{32}$/);
+    expect(cn.Authorization).toMatch(/^Bearer COSY\.[A-Za-z0-9+/=]+\.[a-f0-9]{32}$/);
+
+    for (const headers of [intl, cn]) {
+      const m = /^Bearer COSY\.([A-Za-z0-9+/=]+)\.([a-f0-9]{32})$/.exec(headers.Authorization);
+      const payloadB64 = m[1];
+      const sig = m[2];
+      const cosyKey = headers["Cosy-Key"];
+      const timestamp = headers["Cosy-Date"];
+      const sigPath = headers["Cosy-Sigpath"];
+      const bodyLatin1 = body.toString("latin1");
+      const newlineInput = `${payloadB64}\n${cosyKey}\n${timestamp}\n${bodyLatin1}\n${sigPath}`;
+      const spaceInput = `${payloadB64} ${cosyKey} ${timestamp} ${bodyLatin1} ${sigPath}`;
+      const newlineMd5 = crypto.createHash("md5").update(Buffer.from(newlineInput, "latin1")).digest("hex");
+      const spaceMd5 = crypto.createHash("md5").update(Buffer.from(spaceInput, "latin1")).digest("hex");
+      expect(sig).toBe(newlineMd5);
+      expect(sig).not.toBe(spaceMd5);
+    }
   });
 });

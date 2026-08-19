@@ -4,6 +4,7 @@ import { testProxyUrl } from "@/lib/network/proxyTest";
 import { isOpenAICompatibleProvider, isAnthropicCompatibleProvider } from "@/shared/constants/providers";
 import { getDefaultModel } from "open-sse/config/providerModels.js";
 import { resolveOllamaLocalHost, PROVIDERS } from "open-sse/config/providers.js";
+import { CN_WORK_PROFILE } from "open-sse/protocol/qoder/profile.js";
 import {
   refreshProviderCredentials,
   shouldRefreshCredentials,
@@ -20,7 +21,7 @@ import {
 import { buildClineHeaders } from "@/shared/utils/clineAuth";
 
 // OAuth provider test endpoints
-const OAUTH_TEST_CONFIG = {
+export const OAUTH_TEST_CONFIG = {
   claude: { checkExpiry: true, refreshable: true },
   codex: {
     url: "https://chatgpt.com/backend-api/codex/responses",
@@ -72,6 +73,17 @@ const OAUTH_TEST_CONFIG = {
     authHeader: "Authorization",
     authPrefix: "Bearer ",
     refreshable: false,
+  },
+  "qoderwork-cn": {
+    url: CN_WORK_PROFILE.userInfoUrl,
+    method: "GET",
+    authHeader: "Authorization",
+    authPrefix: "Bearer ",
+    extraHeaders: {
+      Accept: "application/json",
+      "User-Agent": CN_WORK_PROFILE.oauthUserAgent,
+    },
+    refreshable: true,
   },
   kimi: { checkExpiry: true, refreshable: true },
   "kimi-coding": { checkExpiry: true, refreshable: true },
@@ -238,7 +250,12 @@ async function refreshOAuthToken(connection) {
       return { accessToken: data.access_token, expiresIn: data.expires_in, refreshToken: data.refresh_token || refreshToken };
     }
 
-    if (provider === "codex" || provider === "grok-cli" || provider === "xai") {
+    if (
+      provider === "codex" ||
+      provider === "grok-cli" ||
+      provider === "xai" ||
+      provider === "qoderwork-cn"
+    ) {
       return await refreshProviderCredentials(provider, connection, console);
     }
 

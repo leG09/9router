@@ -2,7 +2,10 @@
  * Grok CLI connection-test semantics: 402 spending-limit is soft success (auth OK).
  */
 import { describe, it, expect } from "vitest";
-import { classifyOAuthProbeResult } from "../../src/app/api/providers/[id]/test/testUtils.js";
+import {
+  classifyOAuthProbeResult,
+  OAUTH_TEST_CONFIG,
+} from "../../src/app/api/providers/[id]/test/testUtils.js";
 import { PROVIDERS } from "../../open-sse/providers/index.js";
 
 const GROK_CLI_PROBE = {
@@ -15,6 +18,19 @@ const GROK_CLI_PROBE = {
 };
 
 describe("classifyOAuthProbeResult (grok-cli)", () => {
+  it("registers the QoderWork CN provider test against its CN userinfo endpoint", () => {
+    expect(OAUTH_TEST_CONFIG["qoderwork-cn"]).toMatchObject({
+      url: "https://gateway.qwenwork.cn/api/v1/userinfo",
+      method: "GET",
+      authHeader: "Authorization",
+      authPrefix: "Bearer ",
+      refreshable: true,
+    });
+    expect(OAUTH_TEST_CONFIG["qoderwork-cn"].extraHeaders["User-Agent"]).toBe(
+      "qoderwork/0.1.8",
+    );
+  });
+
   it("treats 200 as hard success", () => {
     const r = classifyOAuthProbeResult({ ok: true, status: 200 }, GROK_CLI_PROBE, "");
     expect(r).toEqual({ valid: true, error: null, soft: false });
