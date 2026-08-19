@@ -98,6 +98,38 @@ export class QoderService {
   }
 
   /**
+   * Resolve the gateway's stateless redirect before opening the browser. The
+   * browser must still visit /oauth2/auth itself because that response creates
+   * the CSRF cookie used by the final /biz/signin login_challenge page.
+   */
+  async resolveBrowserLoginUrl(initialUrl) {
+    const trustedAuthorizeUrl = this.profile.browserAuthorizeUrl;
+    if (!trustedAuthorizeUrl) return initialUrl;
+
+    try {
+      const response = await fetchWithTimeout(this.fetchImpl, initialUrl, {
+        method: "GET",
+        redirect: "manual",
+        headers: {
+          Accept: "text/html,application/xhtml+xml",
+          "User-Agent": "Mozilla/5.0",
+        },
+      });
+      const location = response.headers.get("location");
+      if (response.status < 300 || response.status >= 400 || !location) return initialUrl;
+
+      const resolved = new URL(location, initialUrl);
+      const trusted = new URL(trustedAuthorizeUrl);
+      if (resolved.origin !== trusted.origin || resolved.pathname !== trusted.pathname) {
+        return initialUrl;
+      }
+      return resolved.toString();
+    } catch {
+      return initialUrl;
+    }
+  }
+
+  /**
    * @returns {Promise<{ status: "pending" } | { status: "ok", accessToken: string, refreshToken: string, userId: string, expireTime: number, rawResponse: object }>}
    */
   async pollDeviceToken({ nonce, codeVerifier }) {
@@ -110,7 +142,7 @@ export class QoderService {
       method: "GET",
       headers: {
         Accept: "application/json",
-        "User-Agent": "Go-http-client/2.0",
+        "User-Agent": this.profile.oauthUserAgent || "Go-http-client/2.0",
       },
     });
 
@@ -142,7 +174,11 @@ export class QoderService {
       throw new Error("Qoder device token poll returned 200 but no token");
     }
 
-    const expireMs = QoderService.parseExpiry(body.expires_at, body.expires_in);
+    const expireMs = QoderService.parseExpiry(
+      body.expires_at,
+      body.expires_in,
+      this.profile.expiresInUnit,
+    );
 
     return {
       status: "ok",
@@ -161,7 +197,7 @@ export class QoderService {
         headers: {
           Authorization: `Bearer ${accessToken}`,
           Accept: "application/json",
-          "User-Agent": "Go-http-client/2.0",
+          "User-Agent": this.profile.oauthUserAgent || "Go-http-client/2.0",
         },
       });
       if (!response.ok) return { name: "", email: "" };
@@ -197,9 +233,18 @@ export class QoderService {
       headers: {
         Accept: "application/json",
         "Content-Type": "application/json",
-        "User-Agent": "Go-http-client/2.0",
+        "User-Agent": this.profile.oauthUserAgent || "Go-http-client/2.0",
       },
-      body: JSON.stringify({ refresh_token: refreshToken }),
+      body: JSON.stringify({
+        refresh_token: refreshToken,
+        ...(this.profile.refreshTarget ? { target: this.profile.refreshTarget } : {}),
+        ...(this.profile.deviceClientId && this.profile.deviceRedirectUri
+          ? {
+              client_id: this.profile.deviceClientId,
+              redirect_uri: this.profile.deviceRedirectUri,
+            }
+          : {}),
+      }),
     });
 
     const text = await response.text();
@@ -231,6 +276,7 @@ export class QoderService {
     const expireMs = QoderService.parseExpiry(
       body?.expires_at || body?.expiresAt,
       body?.expires_in ?? body?.expiresIn,
+      this.profile.expiresInUnit,
     );
     const expiresIn = Math.max(60, Math.floor((expireMs - Date.now()) / 1000));
 
@@ -243,7 +289,7 @@ export class QoderService {
     };
   }
 
-  static parseExpiry(expiresAt, expiresInSeconds) {
+  static parseExpiry(expiresAt, expiresIn, expiresInUnit = "seconds") {
     if (typeof expiresAt === "number" && Number.isFinite(expiresAt) && expiresAt > 0) {
       return expiresAt;
     }
@@ -257,11 +303,11 @@ export class QoderService {
       if (!Number.isNaN(parsed)) return parsed;
     }
     if (
-      typeof expiresInSeconds === "number" &&
-      Number.isFinite(expiresInSeconds) &&
-      expiresInSeconds >= 0
+      typeof expiresIn === "number" &&
+      Number.isFinite(expiresIn) &&
+      expiresIn >= 0
     ) {
-      return Date.now() + expiresInSeconds * 1000;
+      return Date.now() + expiresIn * (expiresInUnit === "milliseconds" ? 1 : 1000);
     }
     return Date.now() + 30 * 24 * 60 * 60 * 1000;
   }

@@ -98,6 +98,45 @@ const getStaticProviderModels = (providerId) =>
     name: model.name || model.id,
   }));
 
+const createQoderModelsResolver = ({ profile, routePrefix, label }) => ({
+  customResolver: async (connection) => {
+    const credentials = {
+      accessToken: connection.accessToken,
+      refreshToken: connection.refreshToken,
+      email: connection.email,
+      displayName: connection.displayName,
+      providerSpecificData: connection.providerSpecificData || {},
+    };
+    let warning;
+    try {
+      const result = await resolveQoderModels(credentials, {
+        forceRefresh: true,
+        profile,
+      });
+      if (result?.models?.length) {
+        return {
+          models: result.models.map((model) => ({
+            id: `${routePrefix}/${model.id}`,
+            name: model.name,
+            contextLength: model.contextLength,
+            isVL: model.isVL,
+            isReasoning: model.isReasoning,
+            maxOutputTokens: model.maxOutputTokens,
+            description: model.description,
+            priceFactor: model.priceFactor,
+            isNew: model.isNew,
+          })),
+        };
+      }
+      warning = `${label} returned no models; falling back to static catalog.`;
+    } catch (error) {
+      warning = `Failed to fetch ${label} models: ${error.message}`;
+      console.log(`Failed to fetch ${label} models dynamically, falling back to static:`, error.message);
+    }
+    return { models: [], warning };
+  },
+});
+
 // Generic custom resolver for OAuth providers that need refresh-on-401 + token persist.
 // Receives a `fetchFn(token)` and returns parsed models or throws.
 const buildOAuthResolver = ({ refreshFn, fetchFn, parseFn, errorLabel }) => async (connection) => {
@@ -352,41 +391,16 @@ const PROVIDER_MODELS_CONFIG = {
       return { models: [], warning };
     }
   },
-  qoder: {
-    customResolver: async (connection) => {
-      const credentials = {
-        accessToken: connection.accessToken,
-        refreshToken: connection.refreshToken,
-        email: connection.email,
-        displayName: connection.displayName,
-        providerSpecificData: connection.providerSpecificData || {},
-      };
-      let warning;
-      try {
-        const result = await resolveQoderModels(credentials, { forceRefresh: true });
-        if (result?.models?.length) {
-          return {
-            models: result.models.map((m) => ({
-              // Use the canonical "qoder/<key>" id so the dashboard
-              // surfaces the same identifier the chat router expects.
-              id: `qoder/${m.id}`,
-              name: m.name,
-              contextLength: m.contextLength,
-              isVL: m.isVL,
-              isReasoning: m.isReasoning,
-              maxOutputTokens: m.maxOutputTokens,
-              description: m.description,
-            })),
-          };
-        }
-        warning = "Qoder returned no models; falling back to static catalog.";
-      } catch (error) {
-        warning = `Failed to fetch Qoder models: ${error.message}`;
-        console.log("Failed to fetch Qoder models dynamically, falling back to static:", error.message);
-      }
-      return { models: [], warning };
-    },
-  },
+  qoder: createQoderModelsResolver({
+    profile: "intl",
+    routePrefix: "qoder",
+    label: "Qoder",
+  }),
+  "qoderwork-cn": createQoderModelsResolver({
+    profile: "cn-work",
+    routePrefix: "qdcn",
+    label: "QoderWork CN",
+  }),
   "gemini-cli": {
     customResolver: buildOAuthResolver({
       refreshFn: (conn) => refreshGoogleToken(conn.refreshToken, GEMINI_CONFIG.clientId, GEMINI_CONFIG.clientSecret),

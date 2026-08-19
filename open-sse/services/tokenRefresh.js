@@ -17,6 +17,7 @@ import {
   refreshTraeToken,
   refreshZedToken,
   refreshWindsurfToken,
+  refreshQoderDeviceToken,
   classifyOAuthRefreshError,
 } from "./tokenRefresh/providers.js";
 
@@ -37,6 +38,7 @@ export {
   refreshTraeToken,
   refreshZedToken,
   refreshWindsurfToken,
+  refreshQoderDeviceToken,
   classifyOAuthRefreshError,
 };
 
@@ -147,6 +149,12 @@ const REFRESH_HANDLERS = {
   gcli: (c, log) => refreshXaiToken(c.refreshToken, log),
   "codebuddy-cn": (c, log) => refreshCodebuddyToken(c.refreshToken, log),
   "codebuddy-intl": (c, log) => refreshCodebuddyIntlToken(c.refreshToken, log),
+  "qoderwork-cn": (c, log) =>
+    refreshQoderDeviceToken(
+      c.refreshToken,
+      PROVIDERS["qoderwork-cn"]?.protocolProfile || "cn-work",
+      log,
+    ),
   trae: (c, log) => refreshTraeToken(c.refreshToken, c, log),
   zed: () => refreshZedToken(),
   windsurf: (c, log) => refreshWindsurfToken(c, log),

@@ -32,6 +32,8 @@ import {
  * @property {string} [centerBase]
  * @property {string} chatUrl
  * @property {string} modelListUrl
+ * @property {string[]} [modelListGroups]
+ * @property {Record<string, string>} [modelAliases]
  * @property {string} quotaUrl
  * @property {string} deviceTokenUrl
  * @property {string} [quotaUserAgent] - User-Agent required by quota requests
@@ -42,6 +44,10 @@ import {
  * @property {string} [refreshTokenUrl]
  * @property {string} [deviceClientId] - OAuth device client_id (CN requires it)
  * @property {string} [deviceRedirectUri]
+ * @property {"seconds"|"milliseconds"} [expiresInUnit]
+ * @property {string} [oauthUserAgent]
+ * @property {string} [refreshTarget]
+ * @property {string} [browserAuthorizeUrl] - Trusted first browser-side OAuth hop
  * @property {string} sessionType
  * @property {string} businessProduct
  * @property {string} businessVersion
@@ -85,8 +91,8 @@ export const INTL_PROFILE = {
   machineType: QODER_MACHINE_TYPE,
 };
 
-const CN_OPENAPI = "https://openapi.qoder.com.cn";
-const CN_GATEWAY = "https://gateway.qoder.com.cn";
+const CN_OPENAPI = "https://gateway.qwenwork.cn";
+const CN_GATEWAY = "https://gateway.qwenwork.cn";
 const CN_CHAT_SIG = "/api/v2/service/pro/sse/agent_chat_generation";
 const CN_CHAT_URL = `${CN_GATEWAY}/algo${CN_CHAT_SIG}?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1`;
 
@@ -103,14 +109,29 @@ export const CN_WORK_PROFILE = {
   quotaUserAgent: "QoderWork",
   chatUrl: CN_CHAT_URL,
   modelListUrl: `${CN_GATEWAY}/algo/api/v2/model/list?Encode=1`,
+  // QwenWork enterprise accounts publish chat models under `qwork`; `chat`
+  // remains as a fallback for accounts on the older response shape.
+  modelListGroups: ["qwork", "chat"],
+  modelAliases: {
+    auto: "qwork-auto",
+    // Compatibility for connections saved before the CN catalog was split
+    // from Qoder intl. The enterprise UI exposes this tier as Advanced.
+    qmodel_preview: "qwork-advanced",
+  },
   quotaUrl: `${CN_OPENAPI}/api/v2/quota/usage`,
   deviceTokenUrl: `${CN_OPENAPI}/api/v1/deviceToken/poll`,
   userInfoUrl: `${CN_OPENAPI}/api/v1/userinfo`,
   jobTokenExchangeUrl: `${CN_OPENAPI}/api/v1/jobToken/exchange`,
-  loginUrl: "https://qoder.com.cn/device/selectAccounts",
+  // The gateway starts the device flow, then redirects through
+  // qwenwork.cn/oauth2/auth to /biz/signin?login_challenge=...
+  loginUrl: `${CN_GATEWAY}/device/selectAccounts`,
   refreshTokenUrl: `${CN_OPENAPI}/api/v1/deviceToken/refresh`,
-  deviceClientId: "1c5e33e1-364d-4ce6-b02c-acaa81274a5c",
-  deviceRedirectUri: "qoder-work-cn://",
+  deviceClientId: "e883ade2-e6e3-4d6d-adf7-f92ceff5fdcb",
+  deviceRedirectUri: "qwenwork-cn://",
+  expiresInUnit: "milliseconds",
+  oauthUserAgent: "qoderwork/0.1.8",
+  refreshTarget: "c",
+  browserAuthorizeUrl: "https://qwenwork.cn/oauth2/auth",
   sessionType: "qoder_work",
   businessProduct: "qoder_work",
   businessVersion: "1.0.0",

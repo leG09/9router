@@ -34,6 +34,42 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function normalizeLiveModel(model) {
+  const rawId = model?.id || model?.name;
+  if (!rawId) return null;
+  return {
+    ...model,
+    id: String(rawId).replace(/^(?:qoder|qdcn)\//, ""),
+  };
+}
+
+async function fetchLiveModelsForConnections(providerId, connections) {
+  const activeConnections = connections.filter((connection) =>
+    connection.provider === providerId && connection.isActive !== false && connection.id
+  );
+  const targets = providerId === "qoderwork-cn"
+    ? activeConnections
+    : activeConnections.slice(0, 1);
+  if (targets.length === 0) return [];
+
+  const results = await Promise.allSettled(targets.map(async (connection) => {
+    const response = await fetch(`/api/providers/${connection.id}/models`, { cache: "no-store" });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "Failed to fetch models");
+    return Array.isArray(data.models) ? data.models : [];
+  }));
+
+  const merged = new Map();
+  for (const result of results) {
+    if (result.status !== "fulfilled") continue;
+    for (const rawModel of result.value) {
+      const model = normalizeLiveModel(rawModel);
+      if (model?.id && !merged.has(model.id)) merged.set(model.id, model);
+    }
+  }
+  return [...merged.values()];
+}
+
 export default function ProviderDetailPage() {
   const params = useParams();
   const router = useRouter();
@@ -144,7 +180,7 @@ export default function ProviderDetailPage() {
   const supportsApiKeyAuth = !!APIKEY_PROVIDERS[providerId] || authModes.includes("apikey");
   const isFreeNoAuth = !!FREE_PROVIDERS[providerId]?.noAuth;
   const staticModels = getModelsByProviderId(providerId);
-  const models = providerId === "cursor" && liveModels.length > 0
+  const models = (providerId === "cursor" || providerId === "qoderwork-cn") && liveModels.length > 0
     ? liveModels
     : staticModels;
   const providerAlias = getProviderAlias(providerId);
@@ -457,28 +493,16 @@ export default function ProviderDetailPage() {
     fetchDisabledModels();
   }, [fetchConnections, fetchAliases, fetchCustomModels, fetchDisabledModels]);
 
-  // Cursor's model availability is account-specific and changes frequently.
-  // Load the active account's live catalog for the dashboard; the static
-  // registry remains the fallback while the request is pending or unavailable.
+  // Cursor and QoderWork model availability is account-specific. QoderWork
+  // can have personal and enterprise accounts with different catalogs, so
+  // merge all active account results and use the static registry as fallback.
   useEffect(() => {
-    if (providerId !== "cursor") {
-      setLiveModels([]);
-      return;
-    }
-
-    const connection = connections.find((item) => item.isActive !== false);
-    if (!connection?.id) {
-      setLiveModels([]);
-      return;
-    }
+    if (providerId !== "cursor" && providerId !== "qoderwork-cn") return;
 
     let cancelled = false;
-    fetch(`/api/providers/${connection.id}/models`, { cache: "no-store" })
-      .then(async (res) => ({ ok: res.ok, data: await res.json() }))
-      .then(({ ok, data }) => {
-        if (!cancelled && ok && Array.isArray(data.models) && data.models.length > 0) {
-          setLiveModels(data.models);
-        }
+    fetchLiveModelsForConnections(providerId, connections)
+      .then((nextModels) => {
+        if (!cancelled) setLiveModels(nextModels);
       })
       .catch(() => {});
 
@@ -556,39 +580,31 @@ export default function ProviderDetailPage() {
     }
   };
 
-  // Fetch Qoder model list and automatically add to available models
+  // Refresh Qoder's account-specific catalog. New upstream IDs are also saved
+  // as custom models so they remain selectable if the live endpoint is down.
   const handleImportQoderModels = async () => {
     if (importingQoderModels) return;
-    const activeConnection = connections.find((conn) => conn.isActive !== false);
-    if (!activeConnection) {
+    if (!connections.some((conn) => conn.isActive !== false)) {
       alert(translate("Please add an active Qoder connection first"));
       return;
     }
 
     setImportingQoderModels(true);
     try {
-      const res = await fetch(`/api/providers/${activeConnection.id}/models`);
-      const data = await res.json();
-      if (!res.ok) {
-        alert(data.error || translate("Failed to fetch models"));
-        return;
-      }
-      const models = data.models || [];
-      if (models.length === 0) {
+      const fetchedModels = await fetchLiveModelsForConnections(providerId, connections);
+      if (fetchedModels.length === 0) {
         alert(translate("No models returned"));
         return;
       }
+      if (providerId === "qoderwork-cn") setLiveModels(fetchedModels);
 
       let importedCount = 0;
-      for (const model of models) {
-        const modelId = model.id || model.name;
-        if (!modelId) continue;
-        
-        // Qoder model ID format may be "qoder/auto" or "auto", need to remove prefix
-        const cleanModelId = modelId.replace(/^qoder\//, "");
+      const builtInIds = new Set(staticModels.map((model) => model.id));
+      for (const model of fetchedModels) {
+        const cleanModelId = model.id;
         const alreadyExists = customModels.some(
           (entry) => entry.providerAlias === providerStorageAlias && entry.id === cleanModelId && (entry.kind || entry.type || "llm") === "llm"
-        ) || Object.values(modelAliases).includes(`${providerStorageAlias}/${cleanModelId}`);
+        ) || builtInIds.has(cleanModelId);
         if (alreadyExists) {
           continue;
         }
@@ -598,9 +614,9 @@ export default function ProviderDetailPage() {
       }
       
       if (importedCount === 0) {
-        alert(translate("All models already exist, no new models added"));
+        alert(`${translate("Live model catalog synced")}: ${fetchedModels.length}`);
       } else {
-        alert(translate("Successfully added") + ` ${importedCount} ` + translate("models"));
+        alert(`${translate("Live model catalog synced")}: ${fetchedModels.length}. ${translate("Successfully added")} ${importedCount} ${translate("models")}`);
       }
     } catch (error) {
       console.log("Error importing Qoder models:", error);
@@ -1170,8 +1186,8 @@ export default function ProviderDetailPage() {
           Add Model
         </button>
 
-        {/* Import Qoder models button — only show for qoder provider */}
-        {providerId === "qoder" && connections.some((conn) => conn.isActive !== false) && (
+        {/* Refresh the account-specific Qoder catalog. */}
+        {(providerId === "qoder" || providerId === "qoderwork-cn") && connections.some((conn) => conn.isActive !== false) && (
           <button
             onClick={handleImportQoderModels}
             disabled={importingQoderModels}
@@ -1180,7 +1196,7 @@ export default function ProviderDetailPage() {
             <span className="material-symbols-outlined text-sm" style={importingQoderModels ? { animation: "spin 1s linear infinite" } : undefined}>
               {importingQoderModels ? "progress_activity" : "download"}
             </span>
-            {importingQoderModels ? translate("Fetching...") : translate("Fetch Qoder Models")}
+            {importingQoderModels ? translate("Fetching...") : translate("Sync Live Models")}
           </button>
         )}
 
@@ -1761,6 +1777,7 @@ export default function ProviderDetailPage() {
           isOpen={showAddCustomModel}
           providerAlias={providerStorageAlias}
           providerDisplayAlias={providerDisplayAlias}
+          suggestedModels={models}
           onSave={async (modelId) => {
             await handleAddCustomModel(modelId, "llm", providerStorageAlias);
             setShowAddCustomModel(false);

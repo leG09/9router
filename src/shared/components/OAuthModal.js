@@ -234,6 +234,7 @@ export default function OAuthModal({ isOpen, provider, providerInfo, onSuccess, 
         "codebuddy-cn",
         "codebuddy-intl",
         "qoder",
+        "qoderwork-cn",
         "grok-cli",
       ];
       if (deviceCodeProviders.includes(provider)) {
@@ -259,8 +260,8 @@ export default function OAuthModal({ isOpen, provider, providerInfo, onSuccess, 
         if (verifyUrl) window.open(verifyUrl, "_blank", "noopener,noreferrer");
 
         // Pass extraData for Kiro (contains _clientId, _clientSecret) and
-        // Qoder (contains _qoderMachineId / _qoderNonce — needed so mapTokens
-        // can persist the machine id alongside the token).
+        // Qoder (contains machine identity + nonce so mapTokens can persist
+        // the signing identity alongside the token).
         const extraData = provider === "kiro"
           ? {
               _clientId: data._clientId,
@@ -269,10 +270,11 @@ export default function OAuthModal({ isOpen, provider, providerInfo, onSuccess, 
               _authMethod: data._authMethod,
               _startUrl: data._startUrl,
             }
-          : provider === "qoder"
+          : (provider === "qoder" || provider === "qoderwork-cn")
           ? {
               _qoderNonce: data._qoderNonce,
               _qoderMachineId: data._qoderMachineId,
+              _qoderMachineToken: data._qoderMachineToken,
               _qoderVerifier: data.codeVerifier,
             }
           : (provider === "kimi" || provider === "kimi-coding")

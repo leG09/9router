@@ -318,7 +318,8 @@ async function buildQoderRequestBody({
   includeBusiness = false,
 }) {
   const p = resolveProfile(profile);
-  const qoderKey = String(model || "").replace(/^qoder\//, "");
+  const requestedKey = String(model || "").replace(/^(?:qoder|qdcn)\//, "");
+  const qoderKey = p.modelAliases?.[requestedKey] || requestedKey;
 
   let modelConfig = modelConfigInject;
   if (!modelConfig) {

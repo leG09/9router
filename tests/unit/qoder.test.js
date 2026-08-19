@@ -36,16 +36,20 @@ import {
   CN_WORK_PROFILE,
   resolveProfile,
   createProtocol,
+  resolveQoderModels,
+  clearQoderCatalog,
 } from "../../open-sse/protocol/qoder/index.js";
 import { getCapabilitiesForModel } from "../../open-sse/providers/capabilities.js";
 import { getThinkingLevels } from "../../open-sse/providers/thinkingLevels.js";
 import { applyThinking } from "../../open-sse/translator/concerns/thinkingUnified.js";
 import { refreshQoderDeviceToken } from "../../open-sse/services/tokenRefresh/providers.js";
+import { refreshTokenByProvider } from "../../open-sse/services/tokenRefresh.js";
 import { QoderExecutor } from "../../open-sse/executors/qoder.js";
 import { PROVIDER_MODELS } from "../../open-sse/config/providerModels.js";
 import { PROVIDERS, PROVIDER_OAUTH } from "../../open-sse/providers/index.js";
 import qoderOAuth from "../../src/lib/oauth/providers/qoder.js";
 import qoderworkCnOAuth from "../../src/lib/oauth/providers/qoderwork-cn.js";
+import { getProvider as getOAuthProvider } from "../../src/lib/oauth/providers/index.js";
 
 // Convenience aliases — tests were originally written against module-level
 // helpers; the QoderService class wraps them so each test creates its own
@@ -58,6 +62,18 @@ const parseExpiry = QoderService.parseExpiry;
 describe("provider catalog", () => {
   it("exposes Qoder's latest model in the static provider catalog", () => {
     expect(PROVIDER_MODELS.qd.some((model) => model.id === "qmodel_latest")).toBe(true);
+  });
+
+  it("exposes QoderWork enterprise keys instead of Qoder intl preview keys", () => {
+    const models = PROVIDER_MODELS.qdcn;
+    const ids = models.map((model) => model.id);
+    expect(ids).toContain("qwork-advanced");
+    expect(ids).toContain("qwork-auto");
+    expect(ids).not.toContain("qmodel_preview");
+    expect(models.find((model) => model.id === "qmodel_latest")).toMatchObject({
+      name: "Qwen3.8-Max",
+      priceFactor: 1.1,
+    });
   });
 });
 
@@ -369,6 +385,14 @@ describe("parseExpiry", () => {
     expect(result).toBeLessThanOrEqual(after + 60_000);
   });
 
+  it("supports millisecond expires_in values used by QoderWork CN", () => {
+    const before = Date.now();
+    const result = parseExpiry(undefined, 60_000, "milliseconds");
+    const after = Date.now();
+    expect(result).toBeGreaterThanOrEqual(before + 60_000);
+    expect(result).toBeLessThanOrEqual(after + 60_000);
+  });
+
   // Regression for review finding #7: expiresInSeconds=0 used to be treated
   // as missing and silently fabricated 30-day default. We now honor 0 as
   // "already expired".
@@ -641,7 +665,7 @@ describe("protocol profile", () => {
 
   it("resolves canonical protocol profile ids", () => {
     expect(resolveProfile("cn-work").id).toBe("cn-work");
-    expect(CN_WORK_PROFILE.refreshTokenUrl).toContain("openapi.qoder.com.cn");
+    expect(CN_WORK_PROFILE.refreshTokenUrl).toContain("gateway.qwenwork.cn");
     expect(CN_WORK_PROFILE.deviceClientId).toBeTruthy();
   });
 
@@ -763,6 +787,25 @@ describe("contract body (awA)", () => {
     source: "system",
     format: "openai",
   };
+
+  it("maps the legacy CN preview key to the enterprise Advanced model", async () => {
+    const { qoderKey, payload } = await buildQoderRequestBody({
+      model: "qdcn/qmodel_preview",
+      body: { messages: [{ role: "user", content: "hello" }] },
+      credentials,
+      profile: "cn-work",
+      modelConfig: {
+        display_name: "Advanced",
+        format: "openai",
+        source: "system",
+        is_vl: true,
+        max_input_tokens: 180000,
+      },
+    });
+    expect(qoderKey).toBe("qwork-advanced");
+    expect(payload.model_config.key).toBe("qwork-advanced");
+    expect(payload.chat_context.extra.modelConfig.key).toBe("qwork-advanced");
+  });
 
   it("builds FREE_INPUT shell without catalog when modelConfig injected", async () => {
     const { qoderKey, payload } = await buildQoderRequestBody({
@@ -1095,19 +1138,108 @@ describe("wrapQoderSSE special tokens", () => {
 });
 
 describe("qoderwork-cn refresh + executor", () => {
+  it("registers the CN OAuth adapter under its public provider id", () => {
+    expect(getOAuthProvider("qoderwork-cn")).toBe(qoderworkCnOAuth);
+  });
+
   it("CN device login URL includes client_id", async () => {
     const flow = await new QoderService({
       profile: "cn-work",
       machineTokenResolver: async (id) => id,
     }).initiateDeviceFlow();
     expect(flow.verificationUriComplete).toContain("client_id=");
-    expect(flow.verificationUriComplete).toContain("qoder.com.cn");
+    expect(flow.verificationUriComplete).toContain("gateway.qwenwork.cn");
+  });
+
+  it("reads enterprise model_config entries from the CN qwork catalog group", async () => {
+    clearQoderCatalog();
+    refreshFetchMock.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          chat: [],
+          qwork: [
+            {
+              key: "qwork-advanced",
+              display_name: "Advanced",
+              enable: true,
+              format: "openai",
+              source: "system",
+              is_vl: true,
+              is_reasoning: false,
+              max_input_tokens: 180000,
+            },
+            {
+              key: "qmodel_latest",
+              display_name: "Standard",
+              enable: true,
+              price_factor: 1.1,
+              max_input_tokens: 180000,
+            },
+          ],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+    const result = await resolveQoderModels(
+      {
+        accessToken: "cn-catalog-token",
+        providerSpecificData: {
+          userId: "cn-catalog-user",
+          machineId: "cn-catalog-machine",
+        },
+      },
+      { profile: "cn-work", forceRefresh: true },
+    );
+    expect(result.models.map((model) => model.id)).toEqual(["qwork-advanced", "qmodel_latest"]);
+    expect(result.models.find((model) => model.id === "qmodel_latest")).toMatchObject({
+      name: "Qwen3.8-Max",
+      priceFactor: 1.1,
+      isNew: true,
+    });
+    expect(result.rawConfigs.get("qwork-advanced")).toMatchObject({
+      display_name: "Advanced",
+      max_input_tokens: 180000,
+    });
+  });
+
+  it("opens CN login at the qwenwork OAuth hop so enterprise sign-in receives its cookies", async () => {
+    refreshFetchMock.mockResolvedValueOnce(
+      new Response(null, {
+        status: 302,
+        headers: {
+          Location:
+            "https://qwenwork.cn/oauth2/auth?client_id=cn-client&state=device-state",
+        },
+      }),
+    );
+
+    const data = await qoderworkCnOAuth.requestDeviceCode(qoderworkCnOAuth.config);
+    const browserUrl = new URL(data.verification_uri_complete);
+    expect(browserUrl.origin + browserUrl.pathname).toBe("https://qwenwork.cn/oauth2/auth");
+    expect(browserUrl.searchParams.get("state")).toBe("device-state");
+    expect(data.device_code).toBe(data._qoderNonce);
+    const [gatewayUrl, init] = refreshFetchMock.mock.calls.at(-1);
+    expect(String(gatewayUrl)).toContain("gateway.qwenwork.cn/device/selectAccounts");
+    expect(init.redirect).toBe("manual");
+  });
+
+  it("does not expose an untrusted CN login redirect to the browser", async () => {
+    const initialUrl = "https://gateway.qwenwork.cn/device/selectAccounts?nonce=n";
+    const svc = new QoderService({
+      profile: "cn-work",
+      fetchImpl: async () =>
+        new Response(null, {
+          status: 302,
+          headers: { Location: "https://example.test/oauth2/auth?state=bad" },
+        }),
+    });
+    await expect(svc.resolveBrowserLoginUrl(initialUrl)).resolves.toBe(initialUrl);
   });
 
   it("refreshQoderDeviceToken maps device_token response", async () => {
     refreshFetchMock.mockResolvedValue(
       new Response(
-        JSON.stringify({ device_token: "dt-x", refresh_token: "rt-x", expires_in: 120 }),
+        JSON.stringify({ device_token: "dt-x", refresh_token: "rt-x", expires_in: 120_000 }),
         { status: 200, headers: { "Content-Type": "application/json" } },
       ),
     );
@@ -1115,6 +1247,34 @@ describe("qoderwork-cn refresh + executor", () => {
     expect(r.accessToken).toBe("dt-x");
     expect(r.refreshToken).toBe("rt-x");
     expect(r.expiresIn).toBeGreaterThanOrEqual(60);
+    expect(r.expiresIn).toBeLessThanOrEqual(120);
+    const [, init] = refreshFetchMock.mock.calls.at(-1);
+    expect(init.headers["User-Agent"]).toBe("qoderwork/0.1.8");
+    expect(JSON.parse(init.body)).toMatchObject({
+      target: "c",
+      client_id: "e883ade2-e6e3-4d6d-adf7-f92ceff5fdcb",
+      redirect_uri: "qwenwork-cn://",
+    });
+  });
+
+  it("routes shared qoderwork-cn refreshes through the cn-work profile", async () => {
+    refreshFetchMock.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({ device_token: "dt-shared", refresh_token: "rt-shared", expires_in: 120_000 }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+    const result = await refreshTokenByProvider(
+      "qoderwork-cn",
+      { refreshToken: "rt-shared-handler" },
+      null,
+    );
+    expect(result).toMatchObject({
+      accessToken: "dt-shared",
+      refreshToken: "rt-shared",
+    });
+    const [url] = refreshFetchMock.mock.calls.at(-1);
+    expect(String(url)).toBe("https://gateway.qwenwork.cn/api/v1/deviceToken/refresh");
   });
 
   it("refresh invalid_grant on 401", async () => {
@@ -1156,6 +1316,27 @@ describe("qoderwork-cn refresh + executor", () => {
       expect(legacy.providerSpecificData.machineToken).toBe("uuid-1");
     }
   });
+
+  it("classifies QoderWork CN OAuth accounts as enterprise or personal", () => {
+    const enterprise = qoderworkCnOAuth.mapTokens({
+      access_token: "dt-enterprise",
+      _qoderUserId: "enterprise-user",
+      _qoderOrganizationId: "org-1",
+    });
+    const personal = qoderworkCnOAuth.mapTokens({
+      access_token: "dt-personal",
+      _qoderUserId: "personal-user",
+    });
+
+    expect(enterprise.providerSpecificData).toMatchObject({
+      organizationId: "org-1",
+      accountType: "enterprise",
+    });
+    expect(personal.providerSpecificData).toMatchObject({
+      organizationId: "",
+      accountType: "personal",
+    });
+  });
 });
 
 describe("cn-work device login URL", () => {
@@ -1165,9 +1346,9 @@ describe("cn-work device login URL", () => {
       machineTokenResolver: async (id) => id,
     }).initiateDeviceFlow();
     const u = new URL(flow.verificationUriComplete);
-    expect(u.origin + u.pathname).toBe("https://qoder.com.cn/device/selectAccounts");
-    expect(u.searchParams.get("client_id")).toBe("1c5e33e1-364d-4ce6-b02c-acaa81274a5c");
-    expect(u.searchParams.get("redirect_uri")).toBe("qoder-work-cn://");
+    expect(u.origin + u.pathname).toBe("https://gateway.qwenwork.cn/device/selectAccounts");
+    expect(u.searchParams.get("client_id")).toBe("e883ade2-e6e3-4d6d-adf7-f92ceff5fdcb");
+    expect(u.searchParams.get("redirect_uri")).toBe("qwenwork-cn://");
     expect(u.searchParams.get("challenge_method")).toBe("S256");
     expect(u.searchParams.get("nonce")).toBe(flow.nonce);
     expect(u.searchParams.get("machine_id")).toBeTruthy();
@@ -1186,7 +1367,7 @@ describe("Cosy SEP (intl + cn-work)", () => {
     };
     const body = Buffer.from("sep-parity", "utf8");
     const intlUrl = "https://api3.qoder.sh/algo/api/v2/model/list?Encode=1";
-    const cnUrl = "https://gateway.qoder.com.cn/algo/api/v2/model/list?Encode=1";
+    const cnUrl = "https://gateway.qwenwork.cn/algo/api/v2/model/list?Encode=1";
     const intl = buildCosyHeaders(body, intlUrl, creds, "intl");
     const cn = buildCosyHeaders(body, cnUrl, creds, "cn-work");
     expect(intl.Authorization).toMatch(/^Bearer COSY\.[A-Za-z0-9+/=]+\.[a-f0-9]{32}$/);

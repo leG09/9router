@@ -36,10 +36,11 @@ const inflight = new Map();
  * Stable cache key per credential (so different login sessions for the same
  * account share an entry).
  */
-function cacheKey(credentials) {
+function cacheKey(credentials, profile = null) {
   const psd = credentials?.providerSpecificData || {};
   const seed = psd.userId || credentials?.refreshToken || credentials?.accessToken || "anonymous";
-  return createHash("sha256").update(`qoder:${seed}`).digest("hex");
+  const profileId = resolveProfile(profile).id;
+  return createHash("sha256").update(`qoder:${profileId}:${seed}`).digest("hex");
 }
 
 /**
@@ -109,14 +110,19 @@ async function fetchQoderCatalogRaw(credentials, signal, proxyOptions = null, pr
   if (!response.ok) return null;
 
   const body = await response.json().catch(() => null);
-  if (!body || !Array.isArray(body.chat)) return null;
+  if (!body || typeof body !== "object") return null;
+
+  const groups = p.modelListGroups || ["chat"];
+  const entries = groups.flatMap((group) =>
+    Array.isArray(body[group]) ? body[group] : [],
+  );
 
   const models = [];
   const rawConfigs = new Map();
-  for (const entry of body.chat) {
+  for (const entry of entries) {
     if (!entry || typeof entry !== "object") continue;
     const key = entry.key;
-    if (!key) continue;
+    if (!key || rawConfigs.has(key)) continue;
 
     // Always cache the config — chat needs model_config even for UI-hidden
     // models (enable:false). Upstream still accepts chat for these keys.
@@ -125,12 +131,17 @@ async function fetchQoderCatalogRaw(credentials, signal, proxyOptions = null, pr
     // Surface the full live catalog to Fetch Models / dashboard. Account
     // enable flags vary a lot on intl free tiers (often only ultimate=true);
     // filtering them out made "获取模型" look empty even when catalog worked.
-    const display =
+    const upstreamDisplay =
       entry.display_name ||
       entry.displayName ||
       entry.name ||
       entry.title ||
       key;
+    // QwenWork's API still reports this frontier slot as "Standard" in some
+    // accounts, while the official client presents it as Qwen3.8-Max.
+    const display = p.id === "cn-work" && key === "qmodel_latest"
+      ? "Qwen3.8-Max"
+      : upstreamDisplay;
     const ctx = Number(entry.max_input_tokens) || 131_072;
     models.push({
       id: key,
@@ -139,7 +150,9 @@ async function fetchQoderCatalogRaw(credentials, signal, proxyOptions = null, pr
       isVL: !!entry.is_vl,
       isReasoning: !!entry.is_reasoning,
       maxOutputTokens: Number(entry.max_output_tokens) || 0,
-      description: entry.description || "",
+      description: entry.description || (p.id === "cn-work" && key === "qmodel_latest" ? "Frontier model" : ""),
+      priceFactor: Number.isFinite(Number(entry.price_factor)) ? Number(entry.price_factor) : undefined,
+      isNew: entry.is_new === true || (p.id === "cn-work" && key === "qmodel_latest"),
       enabled: entry.enable !== false,
     });
   }
@@ -172,7 +185,8 @@ export async function resolveQoderModels(credentials, options = {}) {
   const psd = credentials.providerSpecificData || {};
   if (!psd.userId) return null;
 
-  const key = cacheKey(credentials);
+  const profile = resolveProfile(options.profile);
+  const key = cacheKey(credentials, profile);
   const now = Date.now();
   if (!options.forceRefresh) {
     const cached = catalogCache.get(key);
@@ -189,7 +203,7 @@ export async function resolveQoderModels(credentials, options = {}) {
   }
 
   const fetchPromise = (async () => {
-    const fetched = await fetchQoderCatalogRaw(credentials, options.signal, options.proxyOptions, options.profile);
+    const fetched = await fetchQoderCatalogRaw(credentials, options.signal, options.proxyOptions, profile);
     if (!fetched) return null;
     const entry = {
       expiresAt: Date.now() + CACHE_TTL_MS,
@@ -213,9 +227,9 @@ export async function resolveQoderModels(credentials, options = {}) {
   }
 }
 
-export function invalidateQoderCatalog(credentials) {
+export function invalidateQoderCatalog(credentials, profile = null) {
   if (!credentials) return;
-  catalogCache.delete(cacheKey(credentials));
+  catalogCache.delete(cacheKey(credentials, profile));
 }
 
 export function clearQoderCatalog() {

@@ -16,7 +16,7 @@
  *   while more than PAT_REFRESH_BUFFER_MS remains before expiry.
  *
  * Both URLs come off the resolved Profile, so the same flow works for intl
- * (openapi.qoder.sh) and cn-work (openapi.qoder.com.cn).
+ * (openapi.qoder.sh) and cn-work (gateway.qwenwork.cn).
  */
 
 import { proxyAwareFetch } from "../../utils/proxyFetch.js";

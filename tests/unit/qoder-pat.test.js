@@ -2,7 +2,7 @@
  * Unit tests for the Qoder PAT → job-token exchange (protocol/qoder/pat.js).
  *
  * All network is stubbed: proxyAwareFetch is mocked, so nothing here talks to
- * openapi.qoder.sh / openapi.qoder.com.cn.
+ * openapi.qoder.sh / gateway.qwenwork.cn.
  *
  * Wire contract under test:
  *   POST {profile.jobTokenExchangeUrl}  { personal_token }  → { token, expires_* }
@@ -190,8 +190,8 @@ describe("profile-driven PAT endpoints", () => {
 
     expect(resolved.userId).toBe("uid-cn");
     expect(String(callsTo("/jobToken/exchange")[0][0])).toBe(CN_WORK_PROFILE.jobTokenExchangeUrl);
-    expect(String(callsTo("/jobToken/exchange")[0][0])).toContain("openapi.qoder.com.cn");
-    expect(String(callsTo("/userinfo")[0][0])).toContain("openapi.qoder.com.cn");
+    expect(String(callsTo("/jobToken/exchange")[0][0])).toContain("gateway.qwenwork.cn");
+    expect(String(callsTo("/userinfo")[0][0])).toContain("gateway.qwenwork.cn");
     expect(callsTo("/jobToken/exchange")[0][1].headers["Cosy-ClientType"]).toBe(
       CN_WORK_PROFILE.clientType,
     );
@@ -201,9 +201,9 @@ describe("profile-driven PAT endpoints", () => {
     fetchMock.mockImplementation(async (url) => {
       const s = String(url);
       if (s.includes("/jobToken/exchange")) {
-        return json({ token: s.includes("com.cn") ? "jt-cn" : "jt-intl" });
+        return json({ token: s.includes("gateway.qwenwork.cn") ? "jt-cn" : "jt-intl" });
       }
-      return json({ id: s.includes("com.cn") ? "uid-cn" : "uid-intl" });
+      return json({ id: s.includes("gateway.qwenwork.cn") ? "uid-cn" : "uid-intl" });
     });
 
     const intl = await resolvePatCredential("pt-shared", { profile: "intl" });

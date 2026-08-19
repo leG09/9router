@@ -1,7 +1,8 @@
 import { QODERWORK_CN_CONFIG } from "../constants/oauth.js";
 
 /**
- * QoderWork CN — same device flow as intl Qoder, different hosts + client_id.
+ * QoderWork CN device flow. The gateway redirects the browser into the
+ * qwenwork.cn OAuth UI, where login_challenge identifies the pending request.
  *
  * Everything region-specific lives in the protocol Profile ("cn-work"), so this
  * file only differs from qoder.js in three places: the config, the profile id,
@@ -12,15 +13,18 @@ const qoderworkCn = {
   flowType: "device_code",
   requestDeviceCode: async (config) => {
     const { QoderService } = await import("@/lib/oauth/services/qoder");
-    const flow = await new QoderService({
+    const service = new QoderService({
       profile: config.protocolProfile,
-    }).initiateDeviceFlow();
+    });
+    const flow = await service.initiateDeviceFlow();
+    const browserLoginUrl = await service.resolveBrowserLoginUrl(flow.verificationUriComplete);
     return {
       device_code: flow.nonce,
       user_code: flow.nonce.slice(0, 8).toUpperCase(),
-      // CN has no separate landing page: the complete URL *is* the login page.
-      verification_uri: flow.verificationUriComplete,
-      verification_uri_complete: flow.verificationUriComplete,
+      // Start the browser on qwenwork.cn/oauth2/auth. Its response sets the
+      // CSRF cookie and redirects to /biz/signin with a server-issued challenge.
+      verification_uri: browserLoginUrl,
+      verification_uri_complete: browserLoginUrl,
       expires_in: 300,
       interval: 2,
       codeVerifier: flow.codeVerifier,
@@ -92,6 +96,7 @@ const qoderworkCn = {
         machineId: tokens._qoderMachineId || "",
         machineToken: tokens._qoderMachineToken || tokens._qoderMachineId || "",
         organizationId: tokens._qoderOrganizationId || "",
+        accountType: tokens._qoderOrganizationId ? "enterprise" : "personal",
       },
     };
   },

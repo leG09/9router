@@ -12,6 +12,7 @@ import geminiCli from "./gemini-cli.js";
 import antigravity from "./antigravity.js";
 import iflow from "./iflow.js";
 import qoder from "./qoder.js";
+import qoderworkCn from "./qoderwork-cn.js";
 import qwen from "./qwen.js";
 import github from "./github.js";
 import kiro from "./kiro.js";
@@ -38,6 +39,7 @@ const PROVIDERS = {
   antigravity,
   iflow,
   qoder,
+  "qoderwork-cn": qoderworkCn,
   qwen,
   github,
   kiro,

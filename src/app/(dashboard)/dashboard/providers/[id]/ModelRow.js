@@ -28,6 +28,9 @@ export default function ModelRow({ model, fullModel, alias, copied, onCopy, test
           <code className="max-w-[72vw] truncate rounded bg-sidebar px-1.5 py-0.5 font-mono text-xs text-text-muted sm:max-w-[360px]">{displayModel}</code>
           <span className="flex min-w-0 items-center text-[9px] gap-1 pl-1">
             {model.name && <span className="truncate text-[9px] italic text-text-muted/70">{model.name}</span>}
+            {Number.isFinite(model.priceFactor) && (
+              <span className="shrink-0 text-[9px] font-medium not-italic text-text-muted/70">{model.priceFactor}x</span>
+            )}
             <CapacityBadges caps={caps} colorOverride="text-text-muted/70" size={12} />
           </span>
         </div>
@@ -85,6 +88,8 @@ export default function ModelRow({ model, fullModel, alias, copied, onCopy, test
 ModelRow.propTypes = {
   model: PropTypes.shape({
     id: PropTypes.string.isRequired,
+    name: PropTypes.string,
+    priceFactor: PropTypes.number,
   }).isRequired,
   fullModel: PropTypes.string.isRequired,
   alias: PropTypes.string,
