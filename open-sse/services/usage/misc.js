@@ -313,3 +313,168 @@ export async function getQoderUsage(accessToken, proxyOptions = null) {
     return { message: `Qoder connected. Unable to fetch usage: ${error.message}` };
   }
 }
+
+// QoderWork CN credit balance (qwenwork.cn web API). Works for every account
+// type, unlike gateway quota/usage whose user_quota is null on personal
+// accounts. Response: { code: "ok", data: { balance, freeze_credit } }
+const QODERWORK_CN_BALANCE_URL = "https://qwenwork.cn/user/balance";
+
+function qoderworkCnPlanLabel(userType) {
+  if (typeof userType !== "string" || !userType.trim()) return null;
+  return userType
+    .trim()
+    .split("_")
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(" ");
+}
+
+// CN quota/usage speaks snake_case ({user_quota, add_on_quota,
+// org_resource_package, expires_at, ...}) — unlike Qoder intl's camelCase —
+// so it needs its own parser.
+function qoderworkCnQuotaRecord(quota, resetAt) {
+  if (!quota || typeof quota !== "object") return null;
+  const total = Number(quota.total) || 0;
+  const used = Number(quota.used) || 0;
+  const remaining = Number(quota.remaining) || 0;
+  if (!total && !used && !remaining) return null;
+  const remainingPercentage =
+    total > 0 ? Math.max(0, Math.min(100, (remaining / total) * 100)) : null;
+  return {
+    total,
+    used,
+    remaining,
+    unit: quota.unit || "credits",
+    resetAt,
+    remainingPercentage,
+  };
+}
+
+/**
+ * QoderWork CN usage.
+ *
+ * Two complementary endpoints:
+ * 1. GET gateway.qwenwork.cn/api/v2/quota/usage — rich per-tier quotas
+ *    (enterprise accounts). Personal accounts get user_quota: null.
+ * 2. GET qwenwork.cn/user/balance — credit balance for all account types;
+ *    used as the fallback when the quota endpoint has no records.
+ *
+ * Both accept the device-flow access token as a Bearer token.
+ */
+export async function getQoderworkCnUsage(accessToken, proxyOptions = null) {
+  if (!accessToken) {
+    return { message: "QoderWork CN usage unavailable: no access token" };
+  }
+
+  let plan = null;
+  const quotas = {};
+  let meta = {};
+
+  try {
+    const response = await proxyAwareFetch(
+      U("qoderwork-cn").url,
+      {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          Accept: "application/json",
+          // CN quota endpoints expect the desktop product identity
+          // (cn-work profile quotaUserAgent).
+          "User-Agent": "QoderWork",
+        },
+      },
+      proxyOptions,
+    );
+
+    if (response.status === 401 || response.status === 403) {
+      return {
+        message: `QoderWork CN token expired or unauthorized (${response.status}). Please re-authorize.`,
+      };
+    }
+
+    if (response.ok) {
+      const body = await response.json().catch(() => null);
+      if (body && typeof body === "object") {
+        plan = qoderworkCnPlanLabel(body.user_type);
+        const expiresAtMs =
+          Number.isFinite(Number(body.expires_at)) && Number(body.expires_at) > 0
+            ? Number(body.expires_at)
+            : null;
+        const resetAt = expiresAtMs ? new Date(expiresAtMs).toISOString() : null;
+        const user = qoderworkCnQuotaRecord(body.user_quota, resetAt);
+        if (user) quotas.user = user;
+        const addOn = qoderworkCnQuotaRecord(body.add_on_quota, resetAt);
+        if (addOn) quotas["add-on"] = addOn;
+        const org = qoderworkCnQuotaRecord(body.org_resource_package, resetAt);
+        if (org) quotas.organization = org;
+        meta = {
+          totalUsagePercentage: Number(body.total_usage_percentage) || 0,
+          isQuotaExceeded: !!body.is_quota_exceeded,
+          expiresAt: expiresAtMs,
+        };
+      }
+    }
+  } catch {
+    // Network/proxy failure — try the balance endpoint below.
+  }
+
+  if (Object.keys(quotas).length > 0) {
+    return { plan, quotas, ...meta };
+  }
+
+  // Personal accounts publish no quota records; the web balance endpoint is
+  // the only usage source for them.
+  try {
+    const response = await proxyAwareFetch(
+      QODERWORK_CN_BALANCE_URL,
+      {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          Accept: "application/json",
+        },
+      },
+      proxyOptions,
+    );
+
+    if (response.status === 401 || response.status === 403) {
+      return {
+        message: `QoderWork CN token expired or unauthorized (${response.status}). Please re-authorize.`,
+      };
+    }
+
+    if (!response.ok) {
+      return { message: `QoderWork CN connected. Usage fetch returned ${response.status}.` };
+    }
+
+    const body = await response.json().catch(() => null);
+    if (!body || body.code !== "ok" || !body.data) {
+      return { message: "QoderWork CN connected. Usage response was not JSON." };
+    }
+
+    const balance = Number(body.data.balance) || 0;
+    const freezeCredit = Number(body.data.freeze_credit) || 0;
+    const pool = balance + freezeCredit;
+
+    return {
+      plan,
+      quotas: {
+        // freeze_credit is held by in-flight requests, so it occupies the
+        // "used" slot; the bar then shows the non-frozen share.
+        "Balance (credits)": {
+          used: freezeCredit,
+          total: pool,
+          remaining: balance,
+          remainingPercentage:
+            pool > 0 ? Math.max(0, Math.min(100, (balance / pool) * 100)) : 100,
+          unit: "credits",
+          resetAt: null,
+          unlimited: false,
+        },
+      },
+      balance,
+      freezeCredit,
+    };
+  } catch (error) {
+    return { message: `QoderWork CN connected. Unable to fetch usage: ${error.message}` };
+  }
+}

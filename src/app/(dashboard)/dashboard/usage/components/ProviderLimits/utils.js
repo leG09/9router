@@ -428,6 +428,28 @@ export function parseQuotaData(provider, data) {
         }
         break;
 
+      case "qoderwork-cn":
+        // Same quota shape as Qoder (user / add-on / organization), plus a
+        // "Balance (credits)" row for personal accounts that only expose the
+        // credit balance. Forward remainingPercentage (never absolute
+        // `remaining`, which QuotaTable would render as a percent).
+        if (data.quotas) {
+          Object.entries(data.quotas).forEach(([quotaType, quota]) => {
+            if (quotaType === "organization" && (!quota || (Number(quota.total) || 0) === 0)) {
+              return;
+            }
+            normalizedQuotas.push({
+              name: quotaType === "user" ? "Personal" : quotaType === "organization" ? "Organization" : quotaType === "add-on" ? "Add-on" : quotaType,
+              used: quota.used || 0,
+              total: quota.total || 0,
+              unit: quota.unit,
+              resetAt: quota.resetAt || null,
+              remainingPercentage: quota.remainingPercentage,
+            });
+          });
+        }
+        break;
+
       case "claude":
         if (data.message) {
           // Handle error message case
