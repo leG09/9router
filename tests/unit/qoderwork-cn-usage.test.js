@@ -17,6 +17,7 @@ const load = () => import("../../open-sse/services/usage/misc.js");
 
 const QUOTA_URL = "https://gateway.qwenwork.cn/api/v2/quota/usage";
 const BALANCE_URL = "https://qwenwork.cn/user/balance";
+const WEB_QUOTA_URL = "https://qwenwork.cn/user/quota";
 
 function jsonResponse(body, status = 200) {
   return {
@@ -46,6 +47,48 @@ describe("getQoderworkCnUsage", () => {
     const res = await getQoderworkCnUsage(null);
     expect(res.message).toMatch(/no access token/i);
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("requires a Web Token for enterprise connections instead of showing the personal wallet", async () => {
+    const { getQoderworkCnUsage } = await load();
+    const res = await getQoderworkCnUsage("device-token", null, {
+      accountType: "enterprise",
+      organizationId: "org-1",
+    });
+    expect(res.message).toMatch(/enterprise Web Token/i);
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("combines enterprise /user/quota with /user/balance using the business cookie", async () => {
+    routeByUrl([
+      [WEB_QUOTA_URL, jsonResponse({ code: "ok", data: {
+        user_quota: { allowance: 2000, used: 372.2003, remaining: 1627.7997 },
+        next_used_reset_at: "2026-09-16T00:00:00.000Z",
+      } })],
+      [BALANCE_URL, jsonResponse({ code: "ok", data: { balance: 1627.7997, freeze_credit: 25.8548 } })],
+    ]);
+
+    const { getQoderworkCnUsage } = await load();
+    const res = await getQoderworkCnUsage("device-token", null, {
+      businessToken: "biz-token",
+      accountType: "enterprise",
+      userId: "user-1",
+      organizationId: "org-1",
+    });
+
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(fetchMock.mock.calls.map((call) => call[0])).toEqual(expect.arrayContaining([WEB_QUOTA_URL, BALANCE_URL]));
+    for (const [, init] of fetchMock.mock.calls) {
+      expect(init.headers.Cookie).toBe("token=biz-token");
+      expect(init.headers["x-channel"]).toContain("source_org_id=org-1");
+    }
+    expect(res.quotas.organization).toMatchObject({
+      total: 2000,
+      used: 372.2003,
+      remaining: 1627.7997,
+    });
+    expect(res.balance).toBe(1627.7997);
+    expect(res.freezeCredit).toBe(25.8548);
   });
 
   it("parses enterprise snake_case quota records from quota/usage", async () => {
@@ -112,7 +155,7 @@ describe("getQoderworkCnUsage", () => {
     });
   });
 
-  it("treats freeze_credit as the used share of the balance row", async () => {
+  it("does not treat in-flight freeze_credit as historical usage", async () => {
     routeByUrl([
       [QUOTA_URL, jsonResponse({ user_quota: null, expires_at: 0 })],
       [BALANCE_URL, jsonResponse({ code: "ok", data: { balance: 100, freeze_credit: 25 } })],
@@ -121,9 +164,9 @@ describe("getQoderworkCnUsage", () => {
     const { getQoderworkCnUsage } = await load();
     const res = await getQoderworkCnUsage("token");
     const row = res.quotas["Balance (credits)"];
-    expect(row.used).toBe(25);
-    expect(row.total).toBe(125);
-    expect(row.remainingPercentage).toBe(80);
+    expect(row.used).toBe(0);
+    expect(row.total).toBe(100);
+    expect(row.remainingPercentage).toBe(100);
   });
 
   it("reports an auth-expired message on 401 so the route can force-refresh", async () => {

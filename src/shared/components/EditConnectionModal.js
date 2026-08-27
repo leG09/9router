@@ -23,6 +23,8 @@ export default function EditConnectionModal({ isOpen, connection, proxyPools, on
   });
   const [cloudflareData, setCloudflareData] = useState({ accountId: "" });
   const [region, setRegion] = useState("");
+  const [qoderWorkBusinessToken, setQoderWorkBusinessToken] = useState("");
+  const [removeQoderWorkBusinessToken, setRemoveQoderWorkBusinessToken] = useState(false);
   const [testing, setTesting] = useState(false);
   const [testResult, setTestResult] = useState(null);
   const [validating, setValidating] = useState(false);
@@ -56,12 +58,15 @@ export default function EditConnectionModal({ isOpen, connection, proxyPools, on
       }
       setTestResult(null);
       setValidationResult(null);
+      setQoderWorkBusinessToken("");
+      setRemoveQoderWorkBusinessToken(false);
     }
   }, [connection]);
 
   const isOAuth = connection?.authType === "oauth";
   const isAzure = connection?.provider === "azure";
   const isCloudflareAi = connection?.provider === "cloudflare-ai";
+  const isQoderWorkCn = connection?.provider === "qoderwork-cn";
   const isCompatible = connection
     ? (isOpenAICompatibleProvider(connection.provider) || isAnthropicCompatibleProvider(connection.provider))
     : false;
@@ -171,6 +176,12 @@ export default function EditConnectionModal({ isOpen, connection, proxyPools, on
       if (providerRegions && region) {
         updates.providerSpecificData = buildRegionSpecificData();
       }
+      if (isQoderWorkCn && (qoderWorkBusinessToken.trim() || removeQoderWorkBusinessToken)) {
+        updates.providerSpecificData = {
+          ...(updates.providerSpecificData || {}),
+          businessToken: removeQoderWorkBusinessToken ? "" : qoderWorkBusinessToken.trim(),
+        };
+      }
       
       await onSave(updates);
     } finally {
@@ -226,6 +237,39 @@ export default function EditConnectionModal({ isOpen, connection, proxyPools, on
               </Badge>
             )}
           </>
+        )}
+
+        {isQoderWorkCn && (
+          <div className="rounded-lg border border-accent/20 bg-sidebar/50 p-4">
+            <h3 className="mb-3 text-sm font-semibold">Enterprise usage</h3>
+            <Input
+              label="Enterprise Web Token"
+              type="password"
+              value={qoderWorkBusinessToken}
+              onChange={(e) => {
+                setQoderWorkBusinessToken(e.target.value);
+                if (e.target.value) setRemoveQoderWorkBusinessToken(false);
+              }}
+              placeholder={connection.providerSpecificData?.hasBusinessToken ? "Saved — paste a replacement" : "Paste JWT or Cookie containing token=..."}
+              hint={connection.providerSpecificData?.hasBusinessToken
+                ? `A token is saved${connection.providerSpecificData?.businessTokenExpiresAt ? ` (expires ${new Date(connection.providerSpecificData.businessTokenExpiresAt).toLocaleString()})` : ""}. Leave blank to keep it.`
+                : "Required for enterprise /user/quota and /user/balance. Web tokens normally expire after about two days."}
+              disabled={removeQoderWorkBusinessToken}
+            />
+            {connection.providerSpecificData?.hasBusinessToken && (
+              <label className="mt-3 flex items-center gap-2 text-xs text-text-muted">
+                <input
+                  type="checkbox"
+                  checked={removeQoderWorkBusinessToken}
+                  onChange={(e) => {
+                    setRemoveQoderWorkBusinessToken(e.target.checked);
+                    if (e.target.checked) setQoderWorkBusinessToken("");
+                  }}
+                />
+                Remove the saved enterprise Web Token
+              </label>
+            )}
+          </div>
         )}
 
         {isAzure && (
@@ -313,4 +357,3 @@ EditConnectionModal.propTypes = {
   onSave: PropTypes.func.isRequired,
   onClose: PropTypes.func.isRequired,
 };
-

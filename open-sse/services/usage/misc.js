@@ -318,6 +318,100 @@ export async function getQoderUsage(accessToken, proxyOptions = null) {
 // type, unlike gateway quota/usage whose user_quota is null on personal
 // accounts. Response: { code: "ok", data: { balance, freeze_credit } }
 const QODERWORK_CN_BALANCE_URL = "https://qwenwork.cn/user/balance";
+const QODERWORK_CN_WEB_QUOTA_URL = "https://qwenwork.cn/user/quota";
+
+function qoderworkCnWebHeaders(businessToken, providerSpecificData = {}) {
+  const userId = providerSpecificData.userId || "";
+  const organizationId = providerSpecificData.organizationId || "";
+  const channel = new URLSearchParams({
+    ...(userId ? { source_user_id: userId } : {}),
+    ...(organizationId ? { source_org_id: organizationId } : {}),
+    client: "qoderwork",
+    sourceType: "QoderWork",
+  }).toString();
+  return {
+    Accept: "application/json, text/plain, */*",
+    Cookie: `token=${businessToken}`,
+    "User-Agent": "Mozilla/5.0",
+    "x-client-source": "desktop",
+    ...(channel ? { "x-channel": channel } : {}),
+  };
+}
+
+function qoderworkCnWebQuotaRecord(raw, balance, resetAt) {
+  if (!raw || typeof raw !== "object") return null;
+  const total = Number(raw.allowance ?? raw.total) || 0;
+  const used = Number(raw.used) || 0;
+  const quotaRemaining = Number(raw.remaining);
+  const remaining = Number.isFinite(Number(balance))
+    ? Math.max(0, Number(balance))
+    : Number.isFinite(quotaRemaining) ? Math.max(0, quotaRemaining) : 0;
+  if (!total && !used && !remaining) return null;
+  const percentBase = Number.isFinite(quotaRemaining) ? quotaRemaining : remaining;
+  return {
+    total,
+    used,
+    remaining,
+    unit: raw.unit || "credits",
+    resetAt,
+    remainingPercentage: total > 0
+      ? Math.max(0, Math.min(100, (percentBase / total) * 100))
+      : null,
+  };
+}
+
+function qoderworkCnResetAt(raw) {
+  if (!raw) return null;
+  const numeric = Number(raw);
+  const date = Number.isFinite(numeric)
+    ? new Date(numeric < 1e12 ? numeric * 1000 : numeric)
+    : new Date(raw);
+  return Number.isNaN(date.getTime()) ? null : date.toISOString();
+}
+
+async function getQoderworkCnEnterpriseUsage(businessToken, providerSpecificData, proxyOptions) {
+  const headers = qoderworkCnWebHeaders(businessToken, providerSpecificData);
+  const [quotaResponse, balanceResponse] = await Promise.all([
+    proxyAwareFetch(QODERWORK_CN_WEB_QUOTA_URL, { method: "GET", headers }, proxyOptions),
+    proxyAwareFetch(QODERWORK_CN_BALANCE_URL, { method: "GET", headers }, proxyOptions),
+  ]);
+
+  if ([quotaResponse.status, balanceResponse.status].some((status) => status === 401 || status === 403)) {
+    return {
+      message: "QoderWork CN enterprise Web Token expired or unauthorized. Update it in the connection settings.",
+      businessTokenExpired: true,
+    };
+  }
+  if (!quotaResponse.ok || !balanceResponse.ok) {
+    return {
+      message: `QoderWork CN enterprise usage unavailable (quota ${quotaResponse.status}, balance ${balanceResponse.status}).`,
+    };
+  }
+
+  const quotaBody = await quotaResponse.json().catch(() => null);
+  const balanceBody = await balanceResponse.json().catch(() => null);
+  const quotaData = quotaBody?.data && typeof quotaBody.data === "object" ? quotaBody.data : quotaBody;
+  const balanceData = balanceBody?.data && typeof balanceBody.data === "object" ? balanceBody.data : balanceBody;
+  if (!quotaData || !balanceData || (quotaBody?.code && quotaBody.code !== "ok") || (balanceBody?.code && balanceBody.code !== "ok")) {
+    return { message: "QoderWork CN enterprise usage response was not valid JSON." };
+  }
+
+  const quota = quotaData.user_quota || quotaData.team_quota || quotaData.org_quota;
+  const balance = Number(balanceData.balance);
+  const freezeCredit = Number(balanceData.freeze_credit) || 0;
+  const resetRaw = quotaData.next_used_reset_at || quota?.reset_at || null;
+  const resetAt = qoderworkCnResetAt(resetRaw);
+  const record = qoderworkCnWebQuotaRecord(quota, balance, resetAt);
+  if (!record) return { message: "QoderWork CN enterprise quota record was missing." };
+
+  return {
+    plan: "Enterprise",
+    quotas: { organization: record },
+    balance: Number.isFinite(balance) ? balance : record.remaining,
+    freezeCredit,
+    organizationId: providerSpecificData.organizationId || null,
+  };
+}
 
 function qoderworkCnPlanLabel(userType) {
   if (typeof userType !== "string" || !userType.trim()) return null;
@@ -352,15 +446,37 @@ function qoderworkCnQuotaRecord(quota, resetAt) {
 /**
  * QoderWork CN usage.
  *
- * Two complementary endpoints:
- * 1. GET gateway.qwenwork.cn/api/v2/quota/usage — rich per-tier quotas
- *    (enterprise accounts). Personal accounts get user_quota: null.
- * 2. GET qwenwork.cn/user/balance — credit balance for all account types;
- *    used as the fallback when the quota endpoint has no records.
- *
- * Both accept the device-flow access token as a Bearer token.
+ * Enterprise accounts require the short-lived qwenwork.cn business Web Token:
+ * `/user/quota` supplies allowance/used and `/user/balance` supplies the live
+ * remaining balance. Device OAuth tokens are personal-context tokens even when
+ * userinfo reports an organization, so using one here returns a misleading
+ * untouched personal wallet. Personal accounts retain the gateway/Bearer flow.
  */
-export async function getQoderworkCnUsage(accessToken, proxyOptions = null) {
+export async function getQoderworkCnUsage(accessToken, proxyOptions = null, providerSpecificData = {}) {
+  const businessToken = typeof providerSpecificData?.businessToken === "string"
+    ? providerSpecificData.businessToken.trim()
+    : "";
+  const isEnterprise = providerSpecificData?.accountType === "enterprise" || !!providerSpecificData?.organizationId;
+
+  if (businessToken) {
+    const storedExpiry = Date.parse(providerSpecificData?.businessTokenExpiresAt || "");
+    if (Number.isFinite(storedExpiry) && storedExpiry <= Date.now()) {
+      return {
+        message: "QoderWork CN enterprise Web Token expired. Update it in the connection settings.",
+        businessTokenExpired: true,
+      };
+    }
+    try {
+      return await getQoderworkCnEnterpriseUsage(businessToken, providerSpecificData, proxyOptions);
+    } catch (error) {
+      return { message: `QoderWork CN enterprise usage unavailable: ${error.message}` };
+    }
+  }
+  if (isEnterprise) {
+    return {
+      message: "QoderWork CN enterprise usage requires an enterprise Web Token. Add it in the connection settings.",
+    };
+  }
   if (!accessToken) {
     return { message: "QoderWork CN usage unavailable: no access token" };
   }
@@ -453,19 +569,18 @@ export async function getQoderworkCnUsage(accessToken, proxyOptions = null) {
 
     const balance = Number(body.data.balance) || 0;
     const freezeCredit = Number(body.data.freeze_credit) || 0;
-    const pool = balance + freezeCredit;
 
     return {
       plan,
       quotas: {
-        // freeze_credit is held by in-flight requests, so it occupies the
-        // "used" slot; the bar then shows the non-frozen share.
+        // Personal balance has no published allowance. freeze_credit is
+        // in-flight credit, not historical usage, so expose it as metadata
+        // instead of presenting it as consumed quota.
         "Balance (credits)": {
-          used: freezeCredit,
-          total: pool,
+          used: 0,
+          total: balance,
           remaining: balance,
-          remainingPercentage:
-            pool > 0 ? Math.max(0, Math.min(100, (balance / pool) * 100)) : 100,
+          remainingPercentage: 100,
           unit: "credits",
           resetAt: null,
           unlimited: false,

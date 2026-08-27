@@ -9,6 +9,7 @@ import {
 import { APIKEY_PROVIDERS } from "@/shared/constants/config";
 import { AI_PROVIDERS, FREE_TIER_PROVIDERS, WEB_COOKIE_PROVIDERS, isOpenAICompatibleProvider, isAnthropicCompatibleProvider, isCustomEmbeddingProvider } from "@/shared/constants/providers";
 import { normalizeProviderId, normalizeProviderSpecificData } from "@/lib/providerNormalization";
+import { sanitizeQoderworkProviderSpecificData } from "@/lib/qoderworkBusinessToken";
 
 export const dynamic = "force-dynamic";
 
@@ -69,6 +70,9 @@ export async function GET() {
       return {
         ...c,
         name,
+        providerSpecificData: c.provider === "qoderwork-cn"
+          ? sanitizeQoderworkProviderSpecificData(c.providerSpecificData)
+          : c.providerSpecificData,
         apiKey: undefined,
         accessToken: undefined,
         refreshToken: undefined,

@@ -5,6 +5,10 @@ import {
   updateProviderConnection,
   deleteProviderConnection,
 } from "@/models";
+import {
+  sanitizeQoderworkProviderSpecificData,
+  validateQoderworkBusinessToken,
+} from "@/lib/qoderworkBusinessToken";
 
 function normalizeProxyConfig(body = {}) {
   const hasAnyProxyField =
@@ -70,7 +74,12 @@ export async function GET(request, { params }) {
     }
 
     // Hide sensitive fields
-    const result = { ...connection };
+    const result = {
+      ...connection,
+      providerSpecificData: connection.provider === "qoderwork-cn"
+        ? sanitizeQoderworkProviderSpecificData(connection.providerSpecificData)
+        : connection.providerSpecificData,
+    };
     delete result.apiKey;
     delete result.accessToken;
     delete result.refreshToken;
@@ -140,6 +149,21 @@ export async function PUT(request, { params }) {
         ...(providerSpecificData || {}),
       };
 
+      if (
+        existing.provider === "qoderwork-cn" &&
+        providerSpecificData &&
+        Object.prototype.hasOwnProperty.call(providerSpecificData, "businessToken")
+      ) {
+        try {
+          const parsed = validateQoderworkBusinessToken(providerSpecificData.businessToken);
+          updateData.providerSpecificData.businessToken = parsed.token || null;
+          updateData.providerSpecificData.businessTokenExpiresAt = parsed.expiresAt;
+        } catch (error) {
+          return NextResponse.json({ error: error.message }, { status: 400 });
+        }
+      }
+      delete updateData.providerSpecificData.hasBusinessToken;
+
       if (proxyConfig.hasAnyProxyField) {
         updateData.providerSpecificData.connectionProxyEnabled = proxyConfig.connectionProxyEnabled;
         updateData.providerSpecificData.connectionProxyUrl = proxyConfig.connectionProxyUrl;
@@ -158,7 +182,12 @@ export async function PUT(request, { params }) {
     const updated = await updateProviderConnection(id, updateData);
 
     // Hide sensitive fields
-    const result = { ...updated };
+    const result = {
+      ...updated,
+      providerSpecificData: updated.provider === "qoderwork-cn"
+        ? sanitizeQoderworkProviderSpecificData(updated.providerSpecificData)
+        : updated.providerSpecificData,
+    };
     delete result.apiKey;
     delete result.accessToken;
     delete result.refreshToken;

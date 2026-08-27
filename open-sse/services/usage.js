@@ -43,7 +43,7 @@ const USAGE_HANDLERS = {
     const resolved = await resolveQoderCredentials(c, c.proxyOptions).catch(() => null);
     return getQoderUsage(resolved?.accessToken || c.accessToken, c.proxyOptions);
   },
-  "qoderwork-cn": (c) => getQoderworkCnUsage(c.accessToken, c.proxyOptions),
+  "qoderwork-cn": (c) => getQoderworkCnUsage(c.accessToken, c.proxyOptions, c.providerSpecificData),
   iflow: (c) => getIflowUsage(c.accessToken),
   ollama: (c) => getOllamaUsage(c.apiKey, c.providerSpecificData, c.proxyOptions),
   glm: (c) => getGlmUsage(c.apiKey, c.provider, c.proxyOptions),
