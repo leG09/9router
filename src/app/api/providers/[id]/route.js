@@ -7,7 +7,6 @@ import {
 } from "@/models";
 import {
   sanitizeQoderworkProviderSpecificData,
-  validateQoderworkBusinessToken,
 } from "@/lib/qoderworkBusinessToken";
 
 function normalizeProxyConfig(body = {}) {
@@ -149,19 +148,8 @@ export async function PUT(request, { params }) {
         ...(providerSpecificData || {}),
       };
 
-      if (
-        existing.provider === "qoderwork-cn" &&
-        providerSpecificData &&
-        Object.prototype.hasOwnProperty.call(providerSpecificData, "businessToken")
-      ) {
-        try {
-          const parsed = validateQoderworkBusinessToken(providerSpecificData.businessToken);
-          updateData.providerSpecificData.businessToken = parsed.token || null;
-          updateData.providerSpecificData.businessTokenExpiresAt = parsed.expiresAt;
-        } catch (error) {
-          return NextResponse.json({ error: error.message }, { status: 400 });
-        }
-      }
+      delete updateData.providerSpecificData.businessToken;
+      delete updateData.providerSpecificData.businessTokenExpiresAt;
       delete updateData.providerSpecificData.hasBusinessToken;
 
       if (proxyConfig.hasAnyProxyField) {

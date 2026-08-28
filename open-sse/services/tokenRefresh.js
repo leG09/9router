@@ -150,6 +150,7 @@ const REFRESH_HANDLERS = {
     refreshQoderDeviceToken(
       c.refreshToken,
       PROVIDERS["qoderwork-cn"]?.protocolProfile || "cn-work",
+      c.providerSpecificData,
       log,
     ),
   trae: (c, log) => refreshTraeToken(c.refreshToken, c, log),

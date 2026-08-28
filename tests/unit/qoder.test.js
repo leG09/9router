@@ -1223,6 +1223,65 @@ describe("qoderwork-cn refresh + executor", () => {
     expect(init.redirect).toBe("manual");
   });
 
+  it("switches the callback token to the active enterprise identity", async () => {
+    refreshFetchMock
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        token: "personal-context-token",
+        refresh_token: "refresh-token",
+        user_id: "user-1",
+        expires_in: 604_800_000,
+      }), { status: 200, headers: { "Content-Type": "application/json" } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        data: {
+          identities: [{
+            org_id: "org-1",
+            team_id: "team-1",
+            org_type: "enterprise",
+            org_name: "Example Org",
+            status: "active",
+          }],
+        },
+      }), { status: 200, headers: { "Content-Type": "application/json" } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        code: "ok",
+        data: {
+          access_token: "enterprise-context-token",
+          identity: { org_id: "org-1", team_id: "team-1", org_type: "enterprise" },
+        },
+      }), { status: 200, headers: { "Content-Type": "application/json" } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        code: "ok",
+        data: {
+          user: { id: "user-1", name: "User One", email: "user@example.com", is_biz: true },
+          quota: { total: 2000, used: 10, remaining: 1990 },
+        },
+      }), { status: 200, headers: { "Content-Type": "application/json" } }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        name: "User One",
+        email: "user@example.com",
+      }), { status: 200, headers: { "Content-Type": "application/json" } }));
+
+    const result = await qoderworkCnOAuth.pollToken(
+      qoderworkCnOAuth.config,
+      "nonce-1",
+      "verifier-1",
+      { _qoderMachineId: "machine-1", _qoderMachineToken: "machine-token-1" },
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.data).toMatchObject({
+      access_token: "enterprise-context-token",
+      _qoderOrganizationId: "org-1",
+      _qoderTeamId: "team-1",
+      _qoderIdentityTarget: "biz",
+    });
+    const [switchUrl, switchInit] = refreshFetchMock.mock.calls.find(
+      ([url]) => String(url).includes("/api/v1/adapter/auth/switch"),
+    );
+    expect(String(switchUrl)).toContain("/api/v1/adapter/auth/switch");
+    expect(JSON.parse(switchInit.body)).toEqual({ target: "biz", team_id: "team-1" });
+  });
+
   it("does not expose an untrusted CN login redirect to the browser", async () => {
     const initialUrl = "https://gateway.qwenwork.cn/device/selectAccounts?nonce=n";
     const svc = new QoderService({
@@ -1277,6 +1336,29 @@ describe("qoderwork-cn refresh + executor", () => {
     expect(String(url)).toBe("https://gateway.qwenwork.cn/api/v1/deviceToken/refresh");
   });
 
+  it("preserves the enterprise identity when refreshing QoderWork CN", async () => {
+    refreshFetchMock.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({ device_token: "dt-biz", refresh_token: "rt-biz", expires_in: 120_000 }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+    const result = await refreshTokenByProvider(
+      "qoderwork-cn",
+      {
+        refreshToken: "rt-biz-handler",
+        providerSpecificData: { identityTarget: "biz", teamId: "team-1" },
+      },
+      null,
+    );
+    expect(result.accessToken).toBe("dt-biz");
+    const [, init] = refreshFetchMock.mock.calls.at(-1);
+    expect(JSON.parse(init.body)).toMatchObject({
+      target: "biz",
+      team_id: "team-1",
+    });
+  });
+
   it("refresh invalid_grant on 401", async () => {
     refreshFetchMock.mockResolvedValue(
       new Response(JSON.stringify({ message: "nope" }), {
@@ -1322,6 +1404,8 @@ describe("qoderwork-cn refresh + executor", () => {
       access_token: "dt-enterprise",
       _qoderUserId: "enterprise-user",
       _qoderOrganizationId: "org-1",
+      _qoderTeamId: "team-1",
+      _qoderIdentityTarget: "biz",
     });
     const personal = qoderworkCnOAuth.mapTokens({
       access_token: "dt-personal",
@@ -1330,6 +1414,8 @@ describe("qoderwork-cn refresh + executor", () => {
 
     expect(enterprise.providerSpecificData).toMatchObject({
       organizationId: "org-1",
+      teamId: "team-1",
+      identityTarget: "biz",
       accountType: "enterprise",
     });
     expect(personal.providerSpecificData).toMatchObject({

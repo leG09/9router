@@ -184,14 +184,6 @@ export default function ConnectionRow({ connection, proxyPools, isOAuth, isFirst
                 {qoderWorkAccountType}
               </Badge>
             )}
-            {isQoderWorkCn && qoderWorkAccountType === "Enterprise" && (
-              <Badge
-                variant={connection.providerSpecificData?.hasBusinessToken ? "success" : "warning"}
-                size="sm"
-              >
-                {connection.providerSpecificData?.hasBusinessToken ? "Usage linked" : "Usage token needed"}
-              </Badge>
-            )}
             {hasAnyProxy && (
               <Badge variant={proxyBadgeVariant} size="sm">
                 Proxy
@@ -315,8 +307,8 @@ ConnectionRow.propTypes = {
     providerSpecificData: PropTypes.shape({
       accountType: PropTypes.string,
       organizationId: PropTypes.string,
-      hasBusinessToken: PropTypes.bool,
-      businessTokenExpiresAt: PropTypes.string,
+      teamId: PropTypes.string,
+      identityTarget: PropTypes.string,
       proxyPoolId: PropTypes.string,
       connectionProxyEnabled: PropTypes.bool,
       connectionProxyUrl: PropTypes.string,

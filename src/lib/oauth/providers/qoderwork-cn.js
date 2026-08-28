@@ -56,7 +56,31 @@ const qoderworkCn = {
     if (result.status === "pending") {
       return { ok: false, data: { error: "authorization_pending" } };
     }
-    const userInfo = await svc.fetchUserInfo(result.accessToken);
+    let accessToken = result.accessToken;
+    let enterpriseIdentity = null;
+    let accountContext = null;
+    try {
+      const identities = await svc.fetchCnOAuthIdentities(accessToken);
+      enterpriseIdentity = identities.find((identity) => identity.status === "active") || null;
+      if (enterpriseIdentity) {
+        const switched = await svc.switchCnOAuthIdentity(accessToken, enterpriseIdentity);
+        accessToken = switched.accessToken;
+        enterpriseIdentity = switched.identity;
+      }
+      accountContext = await svc.fetchCnAccountContext(accessToken);
+    } catch (err) {
+      return {
+        ok: false,
+        data: {
+          error: "identity_switch_failed",
+          error_description: err.message,
+        },
+      };
+    }
+    const contextUser = accountContext?.user && typeof accountContext.user === "object"
+      ? accountContext.user
+      : accountContext || {};
+    const userInfo = await svc.fetchUserInfo(accessToken);
     // expireTime is Unix-ms from parseExpiry (already defaults to +30d when the
     // upstream omits expiry). Floor at 1 day so a skewed clock can't truncate.
     const minSeconds = 24 * 60 * 60;
@@ -65,15 +89,19 @@ const qoderworkCn = {
     return {
       ok: true,
       data: {
-        access_token: result.accessToken,
+        access_token: accessToken,
         refresh_token: result.refreshToken,
         expires_in: expiresIn,
         _qoderUserId: result.userId,
         _qoderMachineId: extraData?._qoderMachineId || "",
         _qoderMachineToken: extraData?._qoderMachineToken || extraData?._qoderMachineId || "",
-        _qoderName: userInfo.name,
-        _qoderEmail: userInfo.email,
-        _qoderOrganizationId: userInfo.organizationId,
+        _qoderName: contextUser.name || contextUser.username || userInfo.name,
+        _qoderEmail: contextUser.email || userInfo.email,
+        _qoderOrganizationId: enterpriseIdentity?.organizationId || "",
+        _qoderTeamId: enterpriseIdentity?.teamId || "",
+        _qoderOrganizationName: enterpriseIdentity?.organizationName || "",
+        _qoderOrganizationType: enterpriseIdentity?.organizationType || "",
+        _qoderIdentityTarget: enterpriseIdentity ? "biz" : "c",
       },
     };
   },
@@ -96,7 +124,11 @@ const qoderworkCn = {
         machineId: tokens._qoderMachineId || "",
         machineToken: tokens._qoderMachineToken || tokens._qoderMachineId || "",
         organizationId: tokens._qoderOrganizationId || "",
-        accountType: tokens._qoderOrganizationId ? "enterprise" : "personal",
+        teamId: tokens._qoderTeamId || "",
+        organizationName: tokens._qoderOrganizationName || "",
+        organizationType: tokens._qoderOrganizationType || "",
+        identityTarget: tokens._qoderIdentityTarget || (tokens._qoderTeamId ? "biz" : "c"),
+        accountType: tokens._qoderTeamId ? "enterprise" : "personal",
       },
     };
   },

@@ -52,6 +52,7 @@ export class QoderExecutor extends BaseExecutor {
     return refreshQoderDeviceToken(
       credentials.refreshToken,
       this.getProtocolProfile(),
+      credentials.providerSpecificData,
       log,
     );
   }

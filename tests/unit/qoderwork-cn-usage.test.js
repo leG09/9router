@@ -1,11 +1,3 @@
-/**
- * Unit tests for QoderWork CN usage (quota/usage + /user/balance fallback).
- *
- * Enterprise accounts expose snake_case quota records on the gateway
- * quota/usage endpoint; personal accounts get user_quota: null there and
- * rely on the qwenwork.cn /user/balance credit endpoint instead.
- */
-
 import { describe, it, expect, vi, beforeEach } from "vitest";
 
 const fetchMock = vi.fn();
@@ -15,177 +7,94 @@ vi.mock("../../open-sse/utils/proxyFetch.js", () => ({
 
 const load = () => import("../../open-sse/services/usage/misc.js");
 
-const QUOTA_URL = "https://gateway.qwenwork.cn/api/v2/quota/usage";
-const BALANCE_URL = "https://qwenwork.cn/user/balance";
-const WEB_QUOTA_URL = "https://qwenwork.cn/user/quota";
-
 function jsonResponse(body, status = 200) {
   return {
     ok: status >= 200 && status < 300,
     status,
     json: async () => body,
-    text: async () => JSON.stringify(body),
   };
 }
 
-function routeByUrl(routes) {
-  fetchMock.mockImplementation(async (url) => {
-    for (const [prefix, response] of routes) {
-      if (String(url).startsWith(prefix)) return response;
-    }
-    return jsonResponse({}, 404);
-  });
-}
-
 describe("getQoderworkCnUsage", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-  });
+  beforeEach(() => vi.clearAllMocks());
 
-  it("returns a message when no access token is available", async () => {
+  it("returns a message when no OAuth token is available", async () => {
     const { getQoderworkCnUsage } = await load();
-    const res = await getQoderworkCnUsage(null);
-    expect(res.message).toMatch(/no access token/i);
+    const result = await getQoderworkCnUsage(null);
+    expect(result.message).toMatch(/no access token/i);
     expect(fetchMock).not.toHaveBeenCalled();
   });
 
-  it("requires a Web Token for enterprise connections instead of showing the personal wallet", async () => {
-    const { getQoderworkCnUsage } = await load();
-    const res = await getQoderworkCnUsage("device-token", null, {
-      accountType: "enterprise",
-      organizationId: "org-1",
-    });
-    expect(res.message).toMatch(/enterprise Web Token/i);
-    expect(fetchMock).not.toHaveBeenCalled();
-  });
-
-  it("combines enterprise /user/quota with /user/balance using the business cookie", async () => {
-    routeByUrl([
-      [WEB_QUOTA_URL, jsonResponse({ code: "ok", data: {
-        user_quota: { allowance: 2000, used: 372.2003, remaining: 1627.7997 },
-        next_used_reset_at: "2026-09-16T00:00:00.000Z",
-      } })],
-      [BALANCE_URL, jsonResponse({ code: "ok", data: { balance: 1627.7997, freeze_credit: 25.8548 } })],
-    ]);
+  it("reads enterprise quota from the official account-context endpoint", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({
+      code: "ok",
+      data: {
+        user: { id: "u1", is_biz: true },
+        plan: { name: "企业基础版", user_type: "enterprise" },
+        quota: { total: 2000, used: 372.2997, remaining: 1627.7003, exceeded: false },
+      },
+    }));
 
     const { getQoderworkCnUsage } = await load();
-    const res = await getQoderworkCnUsage("device-token", null, {
-      businessToken: "biz-token",
-      accountType: "enterprise",
-      userId: "user-1",
+    const result = await getQoderworkCnUsage("biz-oauth-token", null, {
+      identityTarget: "biz",
       organizationId: "org-1",
     });
 
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(fetchMock.mock.calls.map((call) => call[0])).toEqual(expect.arrayContaining([WEB_QUOTA_URL, BALANCE_URL]));
-    for (const [, init] of fetchMock.mock.calls) {
-      expect(init.headers.Cookie).toBe("token=biz-token");
-      expect(init.headers["x-channel"]).toContain("source_org_id=org-1");
-    }
-    expect(res.quotas.organization).toMatchObject({
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(String(url)).toContain("/api/v1/adapter/user/account-context");
+    expect(String(url)).toContain("include=user%2Cplan%2Cquota%2Cpage%2Cdata_sharing");
+    expect(init.headers.Authorization).toBe("Bearer biz-oauth-token");
+    expect(result.plan).toBe("企业基础版");
+    expect(result.quotas.organization).toMatchObject({
       total: 2000,
-      used: 372.2003,
-      remaining: 1627.7997,
+      used: 372.2997,
+      remaining: 1627.7003,
     });
-    expect(res.balance).toBe(1627.7997);
-    expect(res.freezeCredit).toBe(25.8548);
+    expect(result.balance).toBe(1627.7003);
+    expect(result.totalUsagePercentage).toBeCloseTo(18.614985, 5);
   });
 
-  it("parses enterprise snake_case quota records from quota/usage", async () => {
-    routeByUrl([
-      [QUOTA_URL, jsonResponse({
-        user_id: "u1",
-        user_type: "enterprise_member",
-        total_usage_percentage: 0.00468765,
-        is_quota_exceeded: false,
-        expires_at: 0,
-        user_quota: { total: 2000, used: 9.3753, remaining: 1990.6247, percentage: 0.00468765, unit: "credits" },
-        add_on_quota: null,
-        org_resource_package: null,
-      })],
-    ]);
+  it("keeps personal OAuth quota in the user row", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({
+      code: "ok",
+      data: {
+        user: { id: "u2", is_biz: false },
+        plan: { name: "个人版", user_type: "personal" },
+        quota: { total: 2100, used: 14, remaining: 2086, exceeded: false },
+      },
+    }));
 
     const { getQoderworkCnUsage } = await load();
-    const res = await getQoderworkCnUsage("token");
-
-    expect(fetchMock).toHaveBeenCalledTimes(1); // no balance fallback
-    expect(fetchMock.mock.calls[0][0]).toBe(QUOTA_URL);
-    expect(res.plan).toBe("Enterprise Member");
-    expect(res.quotas.user).toMatchObject({
-      total: 2000,
-      used: 9.3753,
-      remaining: 1990.6247,
-      unit: "credits",
-    });
-    expect(res.quotas.user.remainingPercentage).toBeCloseTo(99.53, 1);
-    expect(res.quotas.organization).toBeUndefined();
-    expect(res.isQuotaExceeded).toBe(false);
+    const result = await getQoderworkCnUsage("personal-oauth-token");
+    expect(result.quotas.user.remaining).toBe(2086);
+    expect(result.quotas.organization).toBeUndefined();
   });
 
-  it("falls back to /user/balance when user_quota is null (personal account)", async () => {
-    routeByUrl([
-      [QUOTA_URL, jsonResponse({
-        user_id: "u2",
-        user_type: "personal_standard",
-        total_usage_percentage: 0,
-        user_quota: null,
-        add_on_quota: null,
-        org_resource_package: null,
-        is_quota_exceeded: false,
-        expires_at: 0,
-      })],
-      [BALANCE_URL, jsonResponse({ code: "ok", data: { balance: 2086.0432, freeze_credit: 0 } })],
-    ]);
-
+  it("parses add-on and shared quota records when present", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({
+      code: "ok",
+      data: {
+        user: { id: "u3", is_biz: true },
+        quota: {
+          total: 100,
+          used: 25,
+          remaining: 75,
+          add_on_quota: { total: 20, used: 5, remaining: 15 },
+          shared_quota: { total: 500, used: 10, remaining: 490 },
+        },
+      },
+    }));
     const { getQoderworkCnUsage } = await load();
-    const res = await getQoderworkCnUsage("token");
-
-    expect(fetchMock).toHaveBeenCalledTimes(2);
-    expect(fetchMock.mock.calls[1][0]).toBe(BALANCE_URL);
-    expect(res.plan).toBe("Personal Standard");
-    expect(res.balance).toBe(2086.0432);
-    expect(res.freezeCredit).toBe(0);
-    const row = res.quotas["Balance (credits)"];
-    expect(row).toMatchObject({
-      used: 0,
-      total: 2086.0432,
-      remaining: 2086.0432,
-      remainingPercentage: 100,
-      unit: "credits",
-    });
+    const result = await getQoderworkCnUsage("token", null, { identityTarget: "biz" });
+    expect(result.quotas["add-on"].remaining).toBe(15);
+    expect(result.quotas.organization.remaining).toBe(490);
   });
 
-  it("does not treat in-flight freeze_credit as historical usage", async () => {
-    routeByUrl([
-      [QUOTA_URL, jsonResponse({ user_quota: null, expires_at: 0 })],
-      [BALANCE_URL, jsonResponse({ code: "ok", data: { balance: 100, freeze_credit: 25 } })],
-    ]);
-
+  it("reports an auth-expired message on 401", async () => {
+    fetchMock.mockResolvedValueOnce(jsonResponse({ error: "unauthorized" }, 401));
     const { getQoderworkCnUsage } = await load();
-    const res = await getQoderworkCnUsage("token");
-    const row = res.quotas["Balance (credits)"];
-    expect(row.used).toBe(0);
-    expect(row.total).toBe(100);
-    expect(row.remainingPercentage).toBe(100);
-  });
-
-  it("reports an auth-expired message on 401 so the route can force-refresh", async () => {
-    routeByUrl([[QUOTA_URL, jsonResponse({ error: "unauthorized" }, 401)]]);
-
-    const { getQoderworkCnUsage } = await load();
-    const res = await getQoderworkCnUsage("token");
-    expect(res.quotas).toBeUndefined();
-    expect(res.message.toLowerCase()).toMatch(/expired|unauthorized|401/);
-  });
-
-  it("falls back to balance when quota/usage errors", async () => {
-    routeByUrl([
-      [QUOTA_URL, jsonResponse({ error: "boom" }, 500)],
-      [BALANCE_URL, jsonResponse({ code: "ok", data: { balance: 42, freeze_credit: 0 } })],
-    ]);
-
-    const { getQoderworkCnUsage } = await load();
-    const res = await getQoderworkCnUsage("token");
-    expect(res.quotas["Balance (credits)"].remaining).toBe(42);
+    const result = await getQoderworkCnUsage("expired-token");
+    expect(result.message.toLowerCase()).toMatch(/expired|unauthorized|401/);
   });
 });

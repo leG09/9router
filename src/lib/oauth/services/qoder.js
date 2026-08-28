@@ -16,6 +16,8 @@ async function resolveMachineToken(machineId) {
  */
 
 const FETCH_TIMEOUT_MS = 15_000;
+const CN_ACCOUNT_CONTEXT_PATH =
+  "/api/v1/adapter/user/account-context?include=user,plan,quota,page,data_sharing";
 
 function base64Url(buf) {
   return buf
@@ -33,6 +35,12 @@ async function fetchWithTimeout(fetchImpl, url, init = {}) {
   } finally {
     clearTimeout(timer);
   }
+}
+
+function unwrapAdapterResponse(body) {
+  return body?.data && typeof body.data === "object" && !Array.isArray(body.data)
+    ? body.data
+    : body;
 }
 
 export class QoderService {
@@ -190,6 +198,108 @@ export class QoderService {
     };
   }
 
+  buildCnAdapterUrl(path) {
+    const url = new URL(path, this.profile.openApiBase);
+    // The official desktop app appends its local login-security envelope to
+    // adapter calls. The native security factors are optional; v=1 is enough
+    // for server/headless clients and is accepted by the production gateway.
+    url.searchParams.set(
+      "state",
+      Buffer.from(JSON.stringify({ v: 1 })).toString("base64url"),
+    );
+    return url.toString();
+  }
+
+  async cnAdapterRequest(path, accessToken, init = {}) {
+    if (this.profile.id !== "cn-work") {
+      throw new Error("Qoder adapter identity APIs are only available for cn-work");
+    }
+    const response = await fetchWithTimeout(
+      this.fetchImpl,
+      this.buildCnAdapterUrl(path),
+      {
+        method: init.method || "GET",
+        headers: {
+          Accept: "application/json",
+          Authorization: `Bearer ${accessToken}`,
+          "User-Agent": this.profile.oauthUserAgent || "qoderwork/unknown",
+          "X-Request-Id": crypto.randomUUID(),
+          ...(init.body !== undefined ? { "Content-Type": "application/json" } : {}),
+        },
+        ...(init.body !== undefined ? { body: JSON.stringify(init.body) } : {}),
+      },
+    );
+    const text = await response.text();
+    let body = null;
+    try {
+      body = text ? JSON.parse(text) : {};
+    } catch {
+      body = null;
+    }
+    if (!response.ok) {
+      const message = body?.message || body?.error_description || body?.error || `HTTP ${response.status}`;
+      const error = new Error(`QoderWork CN adapter request failed: ${message}`);
+      error.status = response.status;
+      throw error;
+    }
+    if (!body || typeof body !== "object") {
+      throw new Error("QoderWork CN adapter returned invalid JSON");
+    }
+    return unwrapAdapterResponse(body);
+  }
+
+  async fetchCnOAuthIdentities(accessToken) {
+    const body = await this.cnAdapterRequest(
+      "/api/v1/adapter/auth/identities",
+      accessToken,
+    );
+    const identities = Array.isArray(body?.identities) ? body.identities : [];
+    return identities.flatMap((identity) => {
+      if (!identity || typeof identity !== "object") return [];
+      const organizationId = typeof identity.org_id === "string" ? identity.org_id : "";
+      const teamId = typeof identity.team_id === "string" ? identity.team_id : "";
+      if (!organizationId || !teamId) return [];
+      return [{
+        target: "biz",
+        organizationId,
+        teamId,
+        organizationType: typeof identity.org_type === "string" ? identity.org_type : "",
+        organizationName: typeof identity.org_name === "string"
+          ? identity.org_name
+          : typeof identity.team_name === "string" ? identity.team_name : "",
+        status: typeof identity.status === "string" ? identity.status : "",
+      }];
+    });
+  }
+
+  async switchCnOAuthIdentity(accessToken, identity) {
+    if (!identity?.teamId) throw new Error("QoderWork CN enterprise identity is missing teamId");
+    const body = await this.cnAdapterRequest(
+      "/api/v1/adapter/auth/switch",
+      accessToken,
+      { method: "POST", body: { target: "biz", team_id: identity.teamId } },
+    );
+    const switchedToken = body?.access_token || body?.token;
+    if (!switchedToken || typeof switchedToken !== "string") {
+      throw new Error("QoderWork CN identity switch returned no access token");
+    }
+    return {
+      accessToken: switchedToken,
+      expiresAt: body?.expires_at || null,
+      expiresIn: Number.isFinite(Number(body?.expires_in)) ? Number(body.expires_in) : null,
+      identity: {
+        ...identity,
+        organizationId: body?.identity?.org_id || identity.organizationId,
+        teamId: body?.identity?.team_id || identity.teamId,
+        organizationType: body?.identity?.org_type || identity.organizationType,
+      },
+    };
+  }
+
+  async fetchCnAccountContext(accessToken) {
+    return this.cnAdapterRequest(CN_ACCOUNT_CONTEXT_PATH, accessToken);
+  }
+
   async fetchUserInfo(accessToken) {
     try {
       const response = await fetchWithTimeout(this.fetchImpl, this.profile.userInfoUrl, {
@@ -219,7 +329,7 @@ export class QoderService {
    * @param {string} refreshToken
    * @returns {Promise<{ accessToken: string, refreshToken: string, expiresIn: number, expireTime: number }>}
    */
-  async refreshDeviceToken(refreshToken) {
+  async refreshDeviceToken(refreshToken, identity = null) {
     if (!refreshToken) {
       throw new Error("refreshDeviceToken: missing refresh token");
     }
@@ -237,7 +347,9 @@ export class QoderService {
       },
       body: JSON.stringify({
         refresh_token: refreshToken,
-        ...(this.profile.refreshTarget ? { target: this.profile.refreshTarget } : {}),
+        ...(identity?.target === "biz" && identity.teamId
+          ? { target: "biz", team_id: identity.teamId }
+          : this.profile.refreshTarget ? { target: this.profile.refreshTarget } : {}),
         ...(this.profile.deviceClientId && this.profile.deviceRedirectUri
           ? {
               client_id: this.profile.deviceClientId,

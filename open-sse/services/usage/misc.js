@@ -314,52 +314,6 @@ export async function getQoderUsage(accessToken, proxyOptions = null) {
   }
 }
 
-// QoderWork CN credit balance (qwenwork.cn web API). Works for every account
-// type, unlike gateway quota/usage whose user_quota is null on personal
-// accounts. Response: { code: "ok", data: { balance, freeze_credit } }
-const QODERWORK_CN_BALANCE_URL = "https://qwenwork.cn/user/balance";
-const QODERWORK_CN_WEB_QUOTA_URL = "https://qwenwork.cn/user/quota";
-
-function qoderworkCnWebHeaders(businessToken, providerSpecificData = {}) {
-  const userId = providerSpecificData.userId || "";
-  const organizationId = providerSpecificData.organizationId || "";
-  const channel = new URLSearchParams({
-    ...(userId ? { source_user_id: userId } : {}),
-    ...(organizationId ? { source_org_id: organizationId } : {}),
-    client: "qoderwork",
-    sourceType: "QoderWork",
-  }).toString();
-  return {
-    Accept: "application/json, text/plain, */*",
-    Cookie: `token=${businessToken}`,
-    "User-Agent": "Mozilla/5.0",
-    "x-client-source": "desktop",
-    ...(channel ? { "x-channel": channel } : {}),
-  };
-}
-
-function qoderworkCnWebQuotaRecord(raw, balance, resetAt) {
-  if (!raw || typeof raw !== "object") return null;
-  const total = Number(raw.allowance ?? raw.total) || 0;
-  const used = Number(raw.used) || 0;
-  const quotaRemaining = Number(raw.remaining);
-  const remaining = Number.isFinite(Number(balance))
-    ? Math.max(0, Number(balance))
-    : Number.isFinite(quotaRemaining) ? Math.max(0, quotaRemaining) : 0;
-  if (!total && !used && !remaining) return null;
-  const percentBase = Number.isFinite(quotaRemaining) ? quotaRemaining : remaining;
-  return {
-    total,
-    used,
-    remaining,
-    unit: raw.unit || "credits",
-    resetAt,
-    remainingPercentage: total > 0
-      ? Math.max(0, Math.min(100, (percentBase / total) * 100))
-      : null,
-  };
-}
-
 function qoderworkCnResetAt(raw) {
   if (!raw) return null;
   const numeric = Number(raw);
@@ -369,49 +323,8 @@ function qoderworkCnResetAt(raw) {
   return Number.isNaN(date.getTime()) ? null : date.toISOString();
 }
 
-async function getQoderworkCnEnterpriseUsage(businessToken, providerSpecificData, proxyOptions) {
-  const headers = qoderworkCnWebHeaders(businessToken, providerSpecificData);
-  const [quotaResponse, balanceResponse] = await Promise.all([
-    proxyAwareFetch(QODERWORK_CN_WEB_QUOTA_URL, { method: "GET", headers }, proxyOptions),
-    proxyAwareFetch(QODERWORK_CN_BALANCE_URL, { method: "GET", headers }, proxyOptions),
-  ]);
-
-  if ([quotaResponse.status, balanceResponse.status].some((status) => status === 401 || status === 403)) {
-    return {
-      message: "QoderWork CN enterprise Web Token expired or unauthorized. Update it in the connection settings.",
-      businessTokenExpired: true,
-    };
-  }
-  if (!quotaResponse.ok || !balanceResponse.ok) {
-    return {
-      message: `QoderWork CN enterprise usage unavailable (quota ${quotaResponse.status}, balance ${balanceResponse.status}).`,
-    };
-  }
-
-  const quotaBody = await quotaResponse.json().catch(() => null);
-  const balanceBody = await balanceResponse.json().catch(() => null);
-  const quotaData = quotaBody?.data && typeof quotaBody.data === "object" ? quotaBody.data : quotaBody;
-  const balanceData = balanceBody?.data && typeof balanceBody.data === "object" ? balanceBody.data : balanceBody;
-  if (!quotaData || !balanceData || (quotaBody?.code && quotaBody.code !== "ok") || (balanceBody?.code && balanceBody.code !== "ok")) {
-    return { message: "QoderWork CN enterprise usage response was not valid JSON." };
-  }
-
-  const quota = quotaData.user_quota || quotaData.team_quota || quotaData.org_quota;
-  const balance = Number(balanceData.balance);
-  const freezeCredit = Number(balanceData.freeze_credit) || 0;
-  const resetRaw = quotaData.next_used_reset_at || quota?.reset_at || null;
-  const resetAt = qoderworkCnResetAt(resetRaw);
-  const record = qoderworkCnWebQuotaRecord(quota, balance, resetAt);
-  if (!record) return { message: "QoderWork CN enterprise quota record was missing." };
-
-  return {
-    plan: "Enterprise",
-    quotas: { organization: record },
-    balance: Number.isFinite(balance) ? balance : record.remaining,
-    freezeCredit,
-    organizationId: providerSpecificData.organizationId || null,
-  };
-}
+const QODERWORK_CN_ACCOUNT_CONTEXT_URL =
+  "https://gateway.qwenwork.cn/api/v1/adapter/user/account-context";
 
 function qoderworkCnPlanLabel(userType) {
   if (typeof userType !== "string" || !userType.trim()) return null;
@@ -446,111 +359,31 @@ function qoderworkCnQuotaRecord(quota, resetAt) {
 /**
  * QoderWork CN usage.
  *
- * Enterprise accounts require the short-lived qwenwork.cn business Web Token:
- * `/user/quota` supplies allowance/used and `/user/balance` supplies the live
- * remaining balance. Device OAuth tokens are personal-context tokens even when
- * userinfo reports an organization, so using one here returns a misleading
- * untouched personal wallet. Personal accounts retain the gateway/Bearer flow.
+ * The device callback first grants a personal-context OAuth token. During
+ * login, enterprise accounts are switched through /adapter/auth/switch and the
+ * resulting is_biz token is persisted. The official desktop client reads quota
+ * from account-context with that switched token; no browser cookie is needed.
  */
 export async function getQoderworkCnUsage(accessToken, proxyOptions = null, providerSpecificData = {}) {
-  const businessToken = typeof providerSpecificData?.businessToken === "string"
-    ? providerSpecificData.businessToken.trim()
-    : "";
-  const isEnterprise = providerSpecificData?.accountType === "enterprise" || !!providerSpecificData?.organizationId;
-
-  if (businessToken) {
-    const storedExpiry = Date.parse(providerSpecificData?.businessTokenExpiresAt || "");
-    if (Number.isFinite(storedExpiry) && storedExpiry <= Date.now()) {
-      return {
-        message: "QoderWork CN enterprise Web Token expired. Update it in the connection settings.",
-        businessTokenExpired: true,
-      };
-    }
-    try {
-      return await getQoderworkCnEnterpriseUsage(businessToken, providerSpecificData, proxyOptions);
-    } catch (error) {
-      return { message: `QoderWork CN enterprise usage unavailable: ${error.message}` };
-    }
-  }
-  if (isEnterprise) {
-    return {
-      message: "QoderWork CN enterprise usage requires an enterprise Web Token. Add it in the connection settings.",
-    };
-  }
   if (!accessToken) {
     return { message: "QoderWork CN usage unavailable: no access token" };
   }
 
-  let plan = null;
-  const quotas = {};
-  let meta = {};
-
   try {
-    const response = await proxyAwareFetch(
-      U("qoderwork-cn").url,
-      {
-        method: "GET",
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          Accept: "application/json",
-          // CN quota endpoints expect the desktop product identity
-          // (cn-work profile quotaUserAgent).
-          "User-Agent": "QoderWork",
-        },
-      },
-      proxyOptions,
+    const url = new URL(QODERWORK_CN_ACCOUNT_CONTEXT_URL);
+    url.searchParams.set("include", "user,plan,quota,page,data_sharing");
+    url.searchParams.set(
+      "state",
+      Buffer.from(JSON.stringify({ v: 1 })).toString("base64url"),
     );
-
-    if (response.status === 401 || response.status === 403) {
-      return {
-        message: `QoderWork CN token expired or unauthorized (${response.status}). Please re-authorize.`,
-      };
-    }
-
-    if (response.ok) {
-      const body = await response.json().catch(() => null);
-      if (body && typeof body === "object") {
-        plan = qoderworkCnPlanLabel(body.user_type);
-        const expiresAtMs =
-          Number.isFinite(Number(body.expires_at)) && Number(body.expires_at) > 0
-            ? Number(body.expires_at)
-            : null;
-        const resetAt = expiresAtMs ? new Date(expiresAtMs).toISOString() : null;
-        const user = qoderworkCnQuotaRecord(body.user_quota, resetAt);
-        if (user) quotas.user = user;
-        const addOn = qoderworkCnQuotaRecord(body.add_on_quota, resetAt);
-        if (addOn) quotas["add-on"] = addOn;
-        const org = qoderworkCnQuotaRecord(body.org_resource_package, resetAt);
-        if (org) quotas.organization = org;
-        meta = {
-          totalUsagePercentage: Number(body.total_usage_percentage) || 0,
-          isQuotaExceeded: !!body.is_quota_exceeded,
-          expiresAt: expiresAtMs,
-        };
-      }
-    }
-  } catch {
-    // Network/proxy failure — try the balance endpoint below.
-  }
-
-  if (Object.keys(quotas).length > 0) {
-    return { plan, quotas, ...meta };
-  }
-
-  // Personal accounts publish no quota records; the web balance endpoint is
-  // the only usage source for them.
-  try {
-    const response = await proxyAwareFetch(
-      QODERWORK_CN_BALANCE_URL,
-      {
-        method: "GET",
-        headers: {
-          Authorization: `Bearer ${accessToken}`,
-          Accept: "application/json",
-        },
+    const response = await proxyAwareFetch(url.toString(), {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${accessToken}`,
+        Accept: "application/json",
+        "User-Agent": "qoderwork/0.1.8",
       },
-      proxyOptions,
-    );
+    }, proxyOptions);
 
     if (response.status === 401 || response.status === 403) {
       return {
@@ -563,33 +396,43 @@ export async function getQoderworkCnUsage(accessToken, proxyOptions = null, prov
     }
 
     const body = await response.json().catch(() => null);
-    if (!body || body.code !== "ok" || !body.data) {
-      return { message: "QoderWork CN connected. Usage response was not JSON." };
+    const data = body?.data && typeof body.data === "object" ? body.data : body;
+    if (!data || typeof data !== "object" || (body?.code && body.code !== "ok")) {
+      return { message: "QoderWork CN account-context response was not valid JSON." };
     }
 
-    const balance = Number(body.data.balance) || 0;
-    const freezeCredit = Number(body.data.freeze_credit) || 0;
+    const user = data.user && typeof data.user === "object" ? data.user : data;
+    const quota = data.quota && typeof data.quota === "object" ? data.quota : null;
+    const planData = data.plan && typeof data.plan === "object" ? data.plan : null;
+    const resetAt = qoderworkCnResetAt(quota?.expires_at || quota?.reset_at || null);
+    const primary = qoderworkCnQuotaRecord(quota, resetAt);
+    if (!primary) {
+      return { message: "QoderWork CN account-context did not include quota." };
+    }
+
+    const isBiz = user.is_biz === true || providerSpecificData?.identityTarget === "biz";
+    const quotas = { [isBiz ? "organization" : "user"]: primary };
+    const addOn = qoderworkCnQuotaRecord(quota?.add_on_quota, resetAt);
+    if (addOn) quotas["add-on"] = addOn;
+    const org = qoderworkCnQuotaRecord(
+      quota?.org_resource_package || quota?.shared_quota,
+      resetAt,
+    );
+    if (org) quotas.organization = org;
+
+    const total = Number(primary.total) || 0;
+    const used = Number(primary.used) || 0;
 
     return {
-      plan,
-      quotas: {
-        // Personal balance has no published allowance. freeze_credit is
-        // in-flight credit, not historical usage, so expose it as metadata
-        // instead of presenting it as consumed quota.
-        "Balance (credits)": {
-          used: 0,
-          total: balance,
-          remaining: balance,
-          remainingPercentage: 100,
-          unit: "credits",
-          resetAt: null,
-          unlimited: false,
-        },
-      },
-      balance,
-      freezeCredit,
+      plan: planData?.name || qoderworkCnPlanLabel(planData?.user_type || (isBiz ? "enterprise" : "personal")),
+      quotas,
+      balance: primary.remaining,
+      freezeCredit: 0,
+      totalUsagePercentage: total > 0 ? (used / total) * 100 : 0,
+      isQuotaExceeded: quota?.exceeded === true || (total > 0 && used >= total),
+      organizationId: providerSpecificData?.organizationId || null,
     };
   } catch (error) {
-    return { message: `QoderWork CN connected. Unable to fetch usage: ${error.message}` };
+    return { message: `QoderWork CN usage unavailable: ${error.message}` };
   }
 }

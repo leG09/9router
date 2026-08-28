@@ -17,7 +17,8 @@ const SAFE_PSD_FIELDS = [
   "connectionProxyEnabled", "connectionProxyUrl", "connectionNoProxy",
   "githubLogin", "githubName", "githubEmail", "githubUserId",
   "username", "firstName", "lastName", "authMethod", "authKind",
-  "profileArn", "organizationId", "accountType", "businessTokenExpiresAt",
+  "profileArn", "organizationId", "teamId", "organizationName", "organizationType",
+  "accountType", "identityTarget",
 ];
 
 const DEFAULT_PAGE_SIZE = 20;
@@ -37,10 +38,6 @@ function sanitize(c) {
     const psd = {};
     for (const f of SAFE_PSD_FIELDS) {
       if (c.providerSpecificData[f] !== undefined) psd[f] = c.providerSpecificData[f];
-    }
-    if (c.provider === "qoderwork-cn") {
-      psd.hasBusinessToken = typeof c.providerSpecificData.businessToken === "string"
-        && c.providerSpecificData.businessToken.length > 0;
     }
     safe.providerSpecificData = psd;
   }

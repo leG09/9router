@@ -661,16 +661,36 @@ export async function refreshWindsurfToken(credentials, log) {
 
 // Qoder / QoderWork CN — POST openapi /api/v1/deviceToken/refresh
 // { refresh_token } → device_token|token + refresh_token
-export async function refreshQoderDeviceToken(refreshToken, profileId = "intl", log) {
+export async function refreshQoderDeviceToken(
+  refreshToken,
+  profileId = "intl",
+  providerSpecificData = null,
+  log = null,
+) {
   if (!refreshToken) return null;
+  // Backward compatibility for callers that previously passed log as arg 3.
+  if (
+    !log &&
+    providerSpecificData &&
+    (typeof providerSpecificData.info === "function" ||
+      typeof providerSpecificData.warn === "function" ||
+      typeof providerSpecificData.error === "function")
+  ) {
+    log = providerSpecificData;
+    providerSpecificData = null;
+  }
   const dedupKey = `qoder:${profileId || "intl"}`;
   return dedupRefresh(dedupKey, refreshToken, async () => {
     try {
       const mod = await import("../../../src/lib/oauth/services/qoder.js");
       const svc = new mod.QoderService({ profile: profileId });
-      const tokens = await svc.refreshDeviceToken(refreshToken);
+      const identity = profileId === "cn-work" && providerSpecificData?.teamId
+        ? { target: "biz", teamId: providerSpecificData.teamId }
+        : null;
+      const tokens = await svc.refreshDeviceToken(refreshToken, identity);
       log?.info?.("TOKEN_REFRESH", "Successfully refreshed Qoder device token", {
         profile: profileId,
+        identityTarget: identity?.target || "c",
         hasNewAccessToken: !!tokens.accessToken,
         hasNewRefreshToken: !!tokens.refreshToken,
         expiresIn: tokens.expiresIn,
