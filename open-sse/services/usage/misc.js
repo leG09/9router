@@ -340,9 +340,14 @@ function qoderworkCnPlanLabel(userType) {
 // so it needs its own parser.
 function qoderworkCnQuotaRecord(quota, resetAt) {
   if (!quota || typeof quota !== "object") return null;
-  const total = Number(quota.total) || 0;
   const used = Number(quota.used) || 0;
   const remaining = Number(quota.remaining) || 0;
+  // Personal/free accounts currently return a balance-shaped quota from
+  // account-context: { total: null, used: null, remaining: 2100 }. Treat the
+  // available balance as the pool size so the dashboard does not interpret
+  // the row as an empty/unlimited 0-total quota.
+  const reportedTotal = Number(quota.total) || 0;
+  const total = reportedTotal > 0 ? reportedTotal : used + remaining;
   if (!total && !used && !remaining) return null;
   const remainingPercentage =
     total > 0 ? Math.max(0, Math.min(100, (remaining / total) * 100)) : null;

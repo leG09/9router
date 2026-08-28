@@ -55,19 +55,26 @@ describe("getQoderworkCnUsage", () => {
     expect(result.totalUsagePercentage).toBeCloseTo(18.614985, 5);
   });
 
-  it("keeps personal OAuth quota in the user row", async () => {
+  it("normalizes the balance-shaped quota returned for personal accounts", async () => {
     fetchMock.mockResolvedValueOnce(jsonResponse({
       code: "ok",
       data: {
         user: { id: "u2", is_biz: false },
-        plan: { name: "个人版", user_type: "personal" },
-        quota: { total: 2100, used: 14, remaining: 2086, exceeded: false },
+        plan: { name: "Free", user_type: "personal" },
+        quota: { total: null, used: null, remaining: 2100, exceeded: false },
       },
     }));
 
     const { getQoderworkCnUsage } = await load();
     const result = await getQoderworkCnUsage("personal-oauth-token");
-    expect(result.quotas.user.remaining).toBe(2086);
+    expect(result.quotas.user).toMatchObject({
+      total: 2100,
+      used: 0,
+      remaining: 2100,
+      remainingPercentage: 100,
+    });
+    expect(result.balance).toBe(2100);
+    expect(result.totalUsagePercentage).toBe(0);
     expect(result.quotas.organization).toBeUndefined();
   });
 
