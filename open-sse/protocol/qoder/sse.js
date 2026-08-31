@@ -18,6 +18,44 @@ function isBillingBlock(inner) {
   return /"code"\s*:\s*"(112|10605)"/.test(inner) || inner.toLowerCase().includes("pricingurl");
 }
 
+/**
+ * Classify a non-200 qoder envelope into an HTTP error shape so chatCore can
+ * refresh/lock the account and fail over to the next connection.
+ */
+function classifyQoderEnvelopeError(statusVal, inner) {
+  if (isBillingBlock(inner)) {
+    return { status: 403, type: "billing_block", code: statusVal };
+  }
+  const isAuth = statusVal === 103 || statusVal === 105 ||
+    /login expired|login timeout|token.*expired|auth/i.test(inner);
+  if (isAuth) {
+    return { status: 401, type: "authentication_error", code: "token_expired" };
+  }
+  const isQueue = statusVal === 10605 || /queue|isQueued|retry_after/i.test(inner);
+  if (isQueue) {
+    return { status: 429, type: "model_queued", code: "model_queued" };
+  }
+  // Everything else (e.g. gateway bodies like
+  // {"code":"400","message":"Error in upstream response"}) is an upstream
+  // failure surfaced as 502 so the account gets locked and failover runs.
+  return { status: 502, type: "qoder_upstream_error", code: statusVal };
+}
+
+/** Build the HTTP error response used to abort the stream before it starts. */
+function qoderEnvelopeErrorResponse(statusVal, inner, message) {
+  const { status, type, code } = classifyQoderEnvelopeError(statusVal, inner);
+  return new Response(
+    JSON.stringify({
+      error: {
+        message: stripHtml(truncate(message, 500)) || `qoder upstream status ${statusVal}`,
+        type,
+        code,
+      },
+    }),
+    { status, headers: { "Content-Type": "application/json" } },
+  );
+}
+
 /** Official special body tokens (Bun EPA). */
 function isSpecialToken(data) {
   return (
@@ -316,8 +354,11 @@ function wrapQoderSSE(response, model) {
 
 /**
  * Inspect the first upstream data frame before creating the SSE transform.
- * Billing blocks must be returned as HTTP 403 so chatCore can lock the
- * exhausted account and continue with the next connection.
+ * A first-frame failure (billing block, auth error, quota exhaustion, or any
+ * non-200 envelope such as {"code":"400","message":"Error in upstream
+ * response"}) must be returned as an HTTP error so chatCore can lock the
+ * broken account and continue with the next connection instead of streaming
+ * an error event that never triggers failover.
  */
 async function wrapQoderSSEWithBilling(response, model) {
   if (!response.ok || !response.body) return response;
@@ -344,6 +385,14 @@ async function wrapQoderSSEWithBilling(response, model) {
       if (!line.startsWith("data:")) continue;
       inspected = true;
       const data = line.slice(5).trimStart();
+      // First-frame quota exhaustion — lock the account and fail over.
+      if (data.startsWith("[EXCEED_QUOTA]")) {
+        await reader.cancel().catch(() => {});
+        return new Response(
+          JSON.stringify({ error: { message: data, type: "qoder_quota_exceeded", code: 429 } }),
+          { status: 429, headers: { "Content-Type": "application/json" } },
+        );
+      }
       let envelope;
       try {
         envelope = JSON.parse(data);
@@ -352,12 +401,9 @@ async function wrapQoderSSEWithBilling(response, model) {
       }
       const statusVal = typeof envelope?.statusCodeValue === "number" ? envelope.statusCodeValue : 200;
       const inner = typeof envelope?.body === "string" ? envelope.body : "";
-      if (statusVal !== 200 && isBillingBlock(inner)) {
+      if (statusVal !== 200) {
         await reader.cancel().catch(() => {});
-        return new Response(
-          JSON.stringify({ error: { message: inner || `qoder billing block (${statusVal})`, code: statusVal } }),
-          { status: 403, headers: { "Content-Type": "application/json" } },
-        );
+        return qoderEnvelopeErrorResponse(statusVal, inner, inner);
       }
       break;
     }
@@ -390,4 +436,4 @@ async function wrapQoderSSEWithBilling(response, model) {
   }), model);
 }
 
-export { wrapQoderSSE, wrapQoderSSEWithBilling, isBillingBlock, isSpecialToken };
+export { wrapQoderSSE, wrapQoderSSEWithBilling, isBillingBlock, isSpecialToken, classifyQoderEnvelopeError };

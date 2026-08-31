@@ -94,7 +94,7 @@ describe("wrapQoderSSE billing detection", () => {
     expect(wrapped.status).toBe(403);
   });
 
-  it("passes through normal errors (non-billing) as wrapped SSE", async () => {
+  it("returns HTTP error when first frame is a non-billing upstream error", async () => {
     const errorEnv = JSON.stringify({
       statusCodeValue: 500,
       body: "Internal server error",
@@ -103,22 +103,55 @@ describe("wrapQoderSSE billing detection", () => {
 
     const wrapped = await wrapQoderSSE(makeResponse([upstream]), "qoder/ultimate");
 
-    // Normal error: still 200 response, error text in SSE body
-    expect(wrapped.status).toBe(200);
-    expect(wrapped.ok).toBe(true);
+    // First-frame failures must surface as HTTP errors so chatCore can lock
+    // the account and fail over to the next connection.
+    expect(wrapped.status).toBe(502);
+    expect(wrapped.ok).toBe(false);
+    const json = await wrapped.json();
+    expect(json.error).toBeDefined();
+    expect(json.error.type).toBe("qoder_upstream_error");
+    expect(json.error.message).toContain("Internal server error");
+  });
 
-    const reader = wrapped.body.getReader();
-    const decoder = new TextDecoder();
-    let buf = "";
-    while (true) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buf += decoder.decode(value, { stream: true });
-    }
-    buf += decoder.decode();
+  it("returns HTTP error for QoderWork CN 'Error in upstream response'", async () => {
+    // Reported bug: the gateway answers HTTP 200 but the first SSE frame is a
+    // non-200 envelope carrying {"code":"400","message":"Error in upstream
+    // response"} for accounts whose upstream identity is unusable. Streaming
+    // that as an in-band error never triggered failover or marked the account.
+    const errorEnv = JSON.stringify({
+      statusCodeValue: 400,
+      body: '{"code":"400","message":"Error in upstream response"}',
+    });
+    const upstream = `data: ${errorEnv}\n\n`;
 
-    expect(buf).toContain("qoder_upstream_error");
-    expect(buf).toContain("data: [DONE]");
+    const wrapped = await wrapQoderSSE(makeResponse([upstream]), "qoder/qmodel_latest");
+
+    expect(wrapped.status).toBe(502);
+    expect(wrapped.ok).toBe(false);
+    const json = await wrapped.json();
+    expect(json.error.message).toContain("Error in upstream response");
+  });
+
+  it("returns 429 when first frame is an EXCEED_QUOTA token", async () => {
+    const upstream = "data: [EXCEED_QUOTA]user_quota\n\n";
+
+    const wrapped = await wrapQoderSSE(makeResponse([upstream]), "qoder/ultimate");
+
+    expect(wrapped.status).toBe(429);
+    expect(wrapped.ok).toBe(false);
+  });
+
+  it("returns 401 when first frame is an auth error", async () => {
+    const authEnv = JSON.stringify({
+      statusCodeValue: 103,
+      body: "login expired",
+    });
+    const upstream = `data: ${authEnv}\n\n`;
+
+    const wrapped = await wrapQoderSSE(makeResponse([upstream]), "qoder/ultimate");
+
+    expect(wrapped.status).toBe(401);
+    expect(wrapped.ok).toBe(false);
   });
 
   it("passes through successful responses unchanged", async () => {

@@ -1,7 +1,7 @@
 import { getProviderConnections, validateApiKey, updateProviderConnection, getSettings, getProxyPools } from "@/lib/localDb";
 import { resolveConnectionProxyConfig, pickProxyPoolId } from "@/lib/network/connectionProxy";
 import { formatRetryAfter, checkFallbackError, isModelLockActive, buildModelLockUpdate, getEarliestModelLockUntil } from "open-sse/services/accountFallback.js";
-import { MAX_RATE_LIMIT_COOLDOWN_MS } from "open-sse/config/errorConfig.js";
+import { MAX_RATE_LIMIT_COOLDOWN_MS, ACCOUNT_ERROR_THRESHOLD, ACCOUNT_ERROR_COOLDOWN_MS } from "open-sse/config/errorConfig.js";
 import { resolveProviderId, FREE_PROVIDERS } from "@/shared/constants/providers.js";
 import * as log from "../utils/logger.js";
 
@@ -226,7 +226,7 @@ export async function markAccountUnavailable(connectionId, status, errorText, pr
   const githubResetAtMs = githubMonthlyResetMs(status, errorText, provider);
 
   // Provider-specific precise cooldown (e.g. codex usage_limit_reached resets_at) overrides backoff
-  let shouldFallback, cooldownMs, newBackoffLevel;
+  let shouldFallback, cooldownMs, newBackoffLevel, accountLevel = false;
   if (githubResetAtMs) {
     shouldFallback = true;
     cooldownMs = githubResetAtMs - Date.now();
@@ -236,31 +236,48 @@ export async function markAccountUnavailable(connectionId, status, errorText, pr
     cooldownMs = Math.min(resetsAtMs - Date.now(), MAX_RATE_LIMIT_COOLDOWN_MS);
     newBackoffLevel = 0;
   } else {
-    ({ shouldFallback, cooldownMs, newBackoffLevel } = checkFallbackError(status, errorText, backoffLevel));
+    ({ shouldFallback, cooldownMs, newBackoffLevel, accountLevel } = checkFallbackError(status, errorText, backoffLevel));
   }
   if (!shouldFallback) return { shouldFallback: false, cooldownMs: 0 };
 
   const reason = typeof errorText === "string" ? errorText.slice(0, 100) : "Provider error";
-  const lockUpdate = buildModelLockUpdate(githubResetAtMs ? null : model, cooldownMs);
+
+  // Account-level failures (e.g. QoderWork CN "Error in upstream response")
+  // are persistent: count consecutive occurrences, and once they repeat mark
+  // the connection as "error" with an account-wide lock so the dashboard stops
+  // presenting it as valid. Non-account-level errors reset the counter.
+  const consecutiveAccountErrors = accountLevel
+    ? (conn?.consecutiveAccountErrors || 0) + 1
+    : 0;
+  const escalateToError = accountLevel && consecutiveAccountErrors >= ACCOUNT_ERROR_THRESHOLD;
+
+  const lockModel = escalateToError || githubResetAtMs ? null : model;
+  const lockCooldownMs = escalateToError ? ACCOUNT_ERROR_COOLDOWN_MS : cooldownMs;
+  const lockUpdate = buildModelLockUpdate(lockModel, lockCooldownMs);
 
   await updateProviderConnection(connectionId, {
     ...lockUpdate,
-    testStatus: "unavailable",
+    testStatus: escalateToError ? "error" : "unavailable",
     lastError: reason,
     errorCode: status,
     lastErrorAt: new Date().toISOString(),
-    backoffLevel: newBackoffLevel ?? backoffLevel
+    backoffLevel: newBackoffLevel ?? backoffLevel,
+    consecutiveAccountErrors
   });
 
   const lockKey = Object.keys(lockUpdate)[0];
   const connName = conn?.displayName || conn?.name || conn?.email || connectionId.slice(0, 8);
-  log.warn("AUTH", `${connName} locked ${lockKey} for ${Math.round(cooldownMs / 1000)}s [${status}]`);
+  if (escalateToError) {
+    log.warn("AUTH", `${connName} marked ERROR after ${consecutiveAccountErrors} account-level failures, locked ${lockKey} for ${Math.round(lockCooldownMs / 1000)}s [${status}]`);
+  } else {
+    log.warn("AUTH", `${connName} locked ${lockKey} for ${Math.round(lockCooldownMs / 1000)}s [${status}]`);
+  }
 
   if (provider && status && reason) {
     console.error(`❌ ${provider} [${status}]: ${reason}`);
   }
 
-  return { shouldFallback: true, cooldownMs };
+  return { shouldFallback: true, cooldownMs: lockCooldownMs };
 }
 
 /**
@@ -278,7 +295,7 @@ export async function clearAccountError(connectionId, currentConnection, model =
   const now = Date.now();
   const allLockKeys = Object.keys(conn).filter(k => k.startsWith("modelLock_"));
 
-  if (!conn.testStatus && !conn.lastError && allLockKeys.length === 0) return;
+  if (!conn.testStatus && !conn.lastError && !conn.consecutiveAccountErrors && allLockKeys.length === 0) return;
 
   // Keys to clear: current model's lock + all expired locks
   const keysToClear = allLockKeys.filter(k => {
@@ -288,7 +305,7 @@ export async function clearAccountError(connectionId, currentConnection, model =
     return expiry && new Date(expiry).getTime() <= now;   // expired
   });
 
-  if (keysToClear.length === 0 && conn.testStatus !== "unavailable" && !conn.lastError) return;
+  if (keysToClear.length === 0 && conn.testStatus !== "unavailable" && conn.testStatus !== "error" && !conn.lastError && !conn.consecutiveAccountErrors) return;
 
   // Check if any active locks remain after clearing
   const remainingActiveLocks = allLockKeys.filter(k => {
@@ -298,6 +315,8 @@ export async function clearAccountError(connectionId, currentConnection, model =
   });
 
   const clearObj = Object.fromEntries(keysToClear.map(k => [k, null]));
+  // A successful request always breaks the consecutive account-error streak.
+  clearObj.consecutiveAccountErrors = 0;
 
   // Only reset error state if no active locks remain
   if (remainingActiveLocks.length === 0) {

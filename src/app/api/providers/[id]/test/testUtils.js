@@ -169,6 +169,41 @@ export function classifyOAuthProbeResult(res, config, bodyText = "") {
   return { valid: true, error: null, soft: false };
 }
 
+/**
+ * QoderWork CN: userinfo stays reachable even after the account's enterprise
+ * identity is frozen, while every chat fails with
+ * {"code":"400","message":"Error in upstream response"}. Probe the identities
+ * endpoint and require at least one active enterprise identity so such
+ * accounts stop testing as valid.
+ */
+async function probeQoderworkCnIdentity(connection, accessToken) {
+  if (connection.provider !== "qoderwork-cn") return { valid: true, error: null };
+  const psd = connection.providerSpecificData || {};
+  const isEnterprise = psd.accountType === "enterprise"
+    || psd.identityTarget === "biz"
+    || !!psd.organizationId;
+  // Personal accounts chat with the plain device token; no biz identity needed.
+  if (!isEnterprise) return { valid: true, error: null };
+
+  try {
+    const { QoderService } = await import("@/lib/oauth/services/qoder");
+    const svc = new QoderService({ profile: CN_WORK_PROFILE.id });
+    const identities = await svc.fetchCnOAuthIdentities(accessToken);
+    if (identities.length === 0) return { valid: true, error: null };
+    const hasActive = identities.some((identity) => identity.status === "active");
+    if (!hasActive) {
+      return {
+        valid: false,
+        error: "Enterprise identity is frozen or expired — chat fails with 'Error in upstream response'. Re-login required.",
+      };
+    }
+    return { valid: true, error: null };
+  } catch {
+    // Fail open: identity probe unavailable — userinfo already passed.
+    return { valid: true, error: null };
+  }
+}
+
 async function probeClineAccessToken(accessToken) {
   const res = await fetch("https://api.cline.bot/api/v1/users/me", {
     method: "GET",
@@ -420,6 +455,10 @@ async function testOAuthConnection(connection, effectiveProxy = null) {
 
     const classified = classifyOAuthProbeResult(res, config, bodyText);
     if (classified.valid) {
+      const identityCheck = await probeQoderworkCnIdentity(connection, accessToken);
+      if (!identityCheck.valid) {
+        return { valid: false, error: identityCheck.error, refreshed, newTokens };
+      }
       return {
         valid: true,
         // soft success surfaces warning text without marking connection error
@@ -443,6 +482,10 @@ async function testOAuthConnection(connection, effectiveProxy = null) {
         const retryBody = !retryRes.ok ? await retryRes.text().catch(() => "") : "";
         const retryClassified = classifyOAuthProbeResult(retryRes, config, retryBody);
         if (retryClassified.valid) {
+          const identityCheck = await probeQoderworkCnIdentity(connection, tokens.accessToken);
+          if (!identityCheck.valid) {
+            return { valid: false, error: identityCheck.error, refreshed: true, newTokens: tokens };
+          }
           return {
             valid: true,
             error: retryClassified.soft ? retryClassified.error : null,

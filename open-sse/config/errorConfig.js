@@ -41,6 +41,13 @@ export const TRANSIENT_COOLDOWN_MS = 30 * 1000;
 // Hard cap for provider-reported rate limit cooldown (e.g. codex resets_at can be 5-6h)
 export const MAX_RATE_LIMIT_COOLDOWN_MS = 30 * 60 * 1000;
 
+// Account-level errors (e.g. a permanently broken credential) escalate to a
+// connection "error" state after this many consecutive failures so the
+// dashboard stops presenting the account as valid.
+export const ACCOUNT_ERROR_THRESHOLD = 3;
+// Account-wide lock applied once an account-level error escalates.
+export const ACCOUNT_ERROR_COOLDOWN_MS = 30 * 60 * 1000;
+
 // Cooldown durations (ms)
 const COOLDOWN = {
   long: 2 * 60 * 1000,
@@ -50,11 +57,13 @@ const COOLDOWN = {
 /**
  * Unified error classification rules.
  * Checked top-to-bottom: text rules first (by order), then status rules.
- * Each rule: { text?, status?, cooldownMs?, backoff? }
+ * Each rule: { text?, status?, cooldownMs?, backoff?, accountLevel? }
  *   - text: substring match (case-insensitive) on error message
  *   - status: HTTP status code match
  *   - cooldownMs: fixed cooldown duration
  *   - backoff: true = use exponential backoff (rate limit)
+ *   - accountLevel: true = persistent account/credential failure; repeated
+ *     occurrences escalate the connection to an "error" state
  */
 export const ERROR_RULES = [
   // --- Text-based rules (checked first, order = priority) ---
@@ -66,6 +75,10 @@ export const ERROR_RULES = [
   { text: "quota exceeded",           backoff: true },
   { text: "capacity",                 backoff: true },
   { text: "overloaded",               backoff: true },
+  // QoderWork CN / Qoder gateway returns this when the account's upstream
+  // identity is unusable (e.g. frozen enterprise membership). The token still
+  // passes userinfo, so only chat surfaces it — treat it as account-level.
+  { text: "error in upstream response", cooldownMs: COOLDOWN.long, accountLevel: true },
 
   // --- Status-based rules (fallback when text doesn't match) ---
   { status: 401, cooldownMs: COOLDOWN.long },
