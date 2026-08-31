@@ -23,6 +23,11 @@ export const QUOTA_SORT_OPTIONS = [
 
 // ─── Pure helpers ─────────────────────────────────────────────────────────────
 export function getConnectionLabel(connection) {
+  // QoderWork CN stores the real username in displayName; name/email are
+  // synthetic dingtalk placeholders, so surface the username instead.
+  if (connection.provider === "qoderwork-cn" && connection.displayName?.trim()) {
+    return connection.displayName.trim();
+  }
   return connection.name?.trim()
     || connection.email?.trim()
     || connection.displayName?.trim()

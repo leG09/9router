@@ -72,6 +72,12 @@ function kiroMethodLabel(conn) {
 }
 
 function getConnectionSecondaryLabel(connection) {
+  // For QoderWork CN the primary label is already the username; show the
+  // organization (enterprise) underneath when known, not the synthetic email.
+  if (connection.provider === "qoderwork-cn") {
+    return connection.providerSpecificData?.organizationName?.trim() || null;
+  }
+
   if (connection.name?.trim() && connection.email?.trim() && connection.name.trim() !== connection.email.trim()) {
     return connection.email.trim();
   }
@@ -1070,6 +1076,23 @@ export default function ProviderLimits() {
                           {getConnectionSecondaryLabel(conn)}
                         </p>
                       ) : null}
+                      {conn.provider !== "kiro" &&
+                        (conn.testStatus === "error" || conn.testStatus === "expired" || conn.testStatus === "unavailable") && (
+                        <div className="mt-1 flex min-w-0 items-center gap-1">
+                          <span
+                            className="inline-flex min-w-0 max-w-full items-center gap-1 rounded-full bg-red-500/10 px-2 py-0.5 text-[10px] font-semibold text-red-600 dark:text-red-400"
+                            title={conn.lastError || conn.testStatus}
+                          >
+                            <span className="material-symbols-outlined text-[12px]">error</span>
+                            <span className="truncate">{conn.testStatus}</span>
+                          </span>
+                          {conn.lastError ? (
+                            <span className="min-w-0 truncate text-[10px] text-red-500/90" title={conn.lastError}>
+                              {conn.lastError}
+                            </span>
+                          ) : null}
+                        </div>
+                      )}
                       {conn.provider === "kiro" && (
                         <div className="mt-1 flex flex-wrap items-center gap-1">
                           <span className="rounded-full bg-brand-500/10 px-2 py-0.5 text-[10px] font-semibold text-brand-600 dark:text-brand-300">
