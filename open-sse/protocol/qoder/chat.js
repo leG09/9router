@@ -9,6 +9,8 @@ import { FETCH_CONNECT_TIMEOUT_MS } from "../../config/runtimeConfig.js";
 import { qoderEncodeBody } from "./encoding.js";
 import { buildCosyHeaders } from "./cosy.js";
 import { buildChatPayload } from "./body.js";
+import { invalidateQoderCatalog } from "./catalog.js";
+import { isQoderCatalogMiss } from "./constants.js";
 import { wrapQoderSSEWithBilling } from "./sse.js";
 import { resolveProfile } from "./profile.js";
 import { isQoderPat, resolvePatCredential } from "./pat.js";
@@ -19,7 +21,7 @@ import { isQoderPat, resolvePatCredential } from "./pat.js";
  * @param {object} [opts.modelConfig] - injected model_config (no catalog fetch)
  * @param {typeof fetch} [opts.fetchImpl] - inject fetch for tests
  * @param {boolean} [opts.includeBusiness]
- * @returns {Promise<{ response: Response, url: string, headers: object, transformedBody: object }>}
+ * @returns {Promise<{ response: Response, url: string, headers: object, transformedBody: object, refreshedCredentials?: { accessToken: string, refreshToken?: string, expiresIn?: number } | null }>}
  */
 export async function chat({
   model,
@@ -92,24 +94,57 @@ export async function chat({
 
   let qoderKey;
   let payload;
+  let refreshedCredentials = null;
+  const payloadOpts = {
+    model,
+    body,
+    credentials,
+    log,
+    proxyOptions,
+    signal,
+    profile: p,
+    modelConfig,
+    includeBusiness,
+  };
   try {
-    ({ qoderKey, payload } = await buildChatPayload({
-      model,
-      body,
-      credentials,
-      log,
-      proxyOptions,
-      signal,
-      profile: p,
-      modelConfig,
-      includeBusiness,
-    }));
+    ({ qoderKey, payload } = await buildChatPayload(payloadOpts));
   } catch (err) {
-    const fakeResp = new Response(
-      JSON.stringify({ error: { message: err.message } }),
-      { status: 400, headers: { "Content-Type": "application/json" } },
-    );
-    return { response: fakeResp, url, headers: {}, transformedBody: body };
+    let finalError = err;
+    // Catalog miss with a refreshable credential: the COSY-signed model/list
+    // request needs a live access token and runs BEFORE chatCore's 401/403
+    // chat-refresh path can fire — an expired/rotated token therefore
+    // surfaces as "model_config not yet known". Refresh the device token
+    // once and retry so healthy accounts aren't failed over.
+    if (isQoderCatalogMiss(err?.message) && credentials?.refreshToken) {
+      try {
+        const { refreshQoderDeviceToken } = await import("../../services/tokenRefresh/providers.js");
+        const refreshed = await refreshQoderDeviceToken(credentials.refreshToken, p.id, psd, log);
+        if (refreshed?.accessToken) {
+          credentials = {
+            ...credentials,
+            accessToken: refreshed.accessToken,
+            refreshToken: refreshed.refreshToken || credentials.refreshToken,
+          };
+          payloadOpts.credentials = credentials;
+          refreshedCredentials = {
+            accessToken: refreshed.accessToken,
+            refreshToken: credentials.refreshToken,
+            ...(refreshed.expiresIn ? { expiresIn: refreshed.expiresIn } : {}),
+          };
+          invalidateQoderCatalog(credentials, p);
+          ({ qoderKey, payload } = await buildChatPayload(payloadOpts));
+        }
+      } catch (retryErr) {
+        finalError = retryErr;
+      }
+    }
+    if (!payload) {
+      const fakeResp = new Response(
+        JSON.stringify({ error: { message: finalError.message } }),
+        { status: 400, headers: { "Content-Type": "application/json" } },
+      );
+      return { response: fakeResp, url, headers: {}, transformedBody: body, refreshedCredentials };
+    }
   }
 
   const plainBody = Buffer.from(JSON.stringify(payload), "utf8");
@@ -171,9 +206,9 @@ export async function chat({
   }
 
   if (!response.ok) {
-    return { response, url, headers, transformedBody: payload };
+    return { response, url, headers, transformedBody: payload, refreshedCredentials };
   }
 
   const wrapped = await wrapQoderSSEWithBilling(response, `qoder/${qoderKey}`);
-  return { response: wrapped, url, headers, transformedBody: payload };
+  return { response: wrapped, url, headers, transformedBody: payload, refreshedCredentials };
 }

@@ -9,7 +9,7 @@
  *   - device flow URL construction
  */
 
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, beforeEach } from "vitest";
 import crypto from "crypto";
 
 const { refreshFetchMock } = vi.hoisted(() => ({ refreshFetchMock: vi.fn() }));
@@ -29,7 +29,13 @@ import {
   QODER_CHAT_URL_ENCODED,
   QODER_MODEL_LIST_URL,
 } from "../../open-sse/protocol/qoder/test-utils.js";
-import { normalizeQoderMachineOs, QODER_MACHINE_OS } from "../../open-sse/protocol/qoder/constants.js";
+import {
+  normalizeQoderMachineOs,
+  QODER_MACHINE_OS,
+  QODER_AUTO_UPDATE_KEYS,
+  isQoderCatalogMiss,
+} from "../../open-sse/protocol/qoder/constants.js";
+import { pickAutoUpdateSuccessor } from "../../open-sse/protocol/qoder/catalog.js";
 import { QoderService } from "../../src/lib/oauth/services/qoder.js";
 import {
   INTL_PROFILE,
@@ -38,6 +44,7 @@ import {
   createProtocol,
   resolveQoderModels,
   clearQoderCatalog,
+  chat as qoderChat,
 } from "../../open-sse/protocol/qoder/index.js";
 import { getCapabilitiesForModel } from "../../open-sse/providers/capabilities.js";
 import { getThinkingLevels } from "../../open-sse/providers/thinkingLevels.js";
@@ -1474,5 +1481,179 @@ describe("Cosy SEP (intl + cn-work)", () => {
       expect(sig).toBe(newlineMd5);
       expect(sig).not.toBe(spaceMd5);
     }
+  });
+});
+
+describe("auto-update model catalog resilience", () => {
+  const credentials = {
+    accessToken: "dt-catalog",
+    refreshToken: "rt-catalog",
+    displayName: "T",
+    email: "t@x.com",
+    providerSpecificData: { userId: "u-catalog", machineId: "m-catalog" },
+  };
+  const json = (data, status = 200) =>
+    new Response(JSON.stringify(data), {
+      status,
+      headers: { "Content-Type": "application/json" },
+    });
+  const frontierEntry = {
+    key: "qmodel_latest",
+    display_name: "Frontier",
+    enable: true,
+    is_reasoning: true,
+    format: "openai",
+    source: "system",
+    max_input_tokens: 200000,
+    max_output_tokens: 8192,
+  };
+
+  beforeEach(() => {
+    clearQoderCatalog();
+    refreshFetchMock.mockReset();
+  });
+
+  it("classifies catalog-miss errors without blaming the account", () => {
+    expect(isQoderCatalogMiss('qoder: model_config for "qmodel_latest" not yet known (inject modelConfig or fetch model list)')).toBe(true);
+    expect(isQoderCatalogMiss("rate limit reached")).toBe(false);
+    expect(isQoderCatalogMiss(null)).toBe(false);
+    expect(QODER_AUTO_UPDATE_KEYS).toContain("qmodel_latest");
+  });
+
+  it("serves the stale catalog when a refresh fetch fails", async () => {
+    refreshFetchMock.mockResolvedValueOnce(json({ chat: [frontierEntry] }));
+    const primed = await resolveQoderModels(credentials, { forceRefresh: true });
+    expect(primed.rawConfigs.has("qmodel_latest")).toBe(true);
+
+    // Provider-side hiccup (or rotated credentials) must not drop the config.
+    refreshFetchMock.mockResolvedValueOnce(new Response("Signature invalid", { status: 401 }));
+    const served = await resolveQoderModels(credentials, { forceRefresh: true });
+    expect(served?.rawConfigs.get("qmodel_latest")).toBeDefined();
+
+    // The stale entry stays expired, so the next call retries upstream.
+    refreshFetchMock.mockResolvedValueOnce(json({ chat: [frontierEntry] }));
+    const refetched = await resolveQoderModels(credentials, { forceRefresh: true });
+    expect(refetched?.rawConfigs.has("qmodel_latest")).toBe(true);
+    expect(refreshFetchMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("keeps the previous catalog when the live list comes back empty", async () => {
+    refreshFetchMock.mockResolvedValueOnce(json({ chat: [frontierEntry] }));
+    await resolveQoderModels(credentials, { forceRefresh: true });
+
+    refreshFetchMock.mockResolvedValueOnce(json({ chat: [] }));
+    const served = await resolveQoderModels(credentials, { forceRefresh: true });
+    expect(served?.rawConfigs.size).toBe(1);
+    expect(served?.rawConfigs.has("qmodel_latest")).toBe(true);
+  });
+
+  it("pickAutoUpdateSuccessor only follows is_new entries for auto-update keys", () => {
+    const catalog = {
+      rawConfigs: new Map([
+        ["qwork-lite", { enable: true, is_new: false }],
+        ["qwen-next", { enable: true, is_new: true }],
+      ]),
+    };
+    expect(pickAutoUpdateSuccessor(catalog, "qmodel_latest")).toMatchObject({ key: "qwen-next" });
+    expect(pickAutoUpdateSuccessor(catalog, "qwork-lite")).toBeNull();
+    expect(pickAutoUpdateSuccessor(null, "qmodel_latest")).toBeNull();
+    expect(
+      pickAutoUpdateSuccessor(
+        { rawConfigs: new Map([["qwen-next", { enable: false, is_new: true }]]) },
+        "qmodel_latest",
+      ),
+    ).toBeNull();
+  });
+
+  it("follows the auto-update successor when the requested key disappears", async () => {
+    const rotated = {
+      chat: [
+        {
+          key: "qwen3.9-max",
+          display_name: "Qwen3.9 Max",
+          enable: true,
+          is_new: true,
+          is_reasoning: true,
+          format: "openai",
+          source: "system",
+          max_input_tokens: 262144,
+          max_output_tokens: 16384,
+        },
+      ],
+    };
+    refreshFetchMock.mockResolvedValueOnce(json(rotated));
+    refreshFetchMock.mockResolvedValueOnce(json(rotated));
+
+    const { qoderKey, payload } = await buildQoderRequestBody({
+      model: "qoder/qmodel_latest",
+      body: { messages: [{ role: "user", content: "hi" }] },
+      credentials,
+    });
+    expect(qoderKey).toBe("qwen3.9-max");
+    expect(payload.model_config.key).toBe("qwen3.9-max");
+    expect(payload.chat_context.extra.modelConfig.key).toBe("qwen3.9-max");
+  });
+
+  it("still rejects unknown keys that are not auto-update aliases", async () => {
+    refreshFetchMock.mockResolvedValueOnce(json({ chat: [frontierEntry] }));
+    refreshFetchMock.mockResolvedValueOnce(json({ chat: [frontierEntry] }));
+    await expect(
+      buildQoderRequestBody({
+        model: "qoder/qmodel-preview-x",
+        body: { messages: [{ role: "user", content: "hi" }] },
+        credentials,
+      }),
+    ).rejects.toThrow(/not yet known/);
+  });
+
+  it("refreshes the device token and retries when the catalog fetch is auth-blocked", async () => {
+    refreshFetchMock
+      // 1+2: catalog fetch fails auth before the chat request can trigger the
+      // usual 401 refresh path.
+      .mockResolvedValueOnce(new Response("Signature invalid", { status: 401 }))
+      .mockResolvedValueOnce(new Response("Signature invalid", { status: 401 }))
+      // 3: deviceToken/refresh returns a fresh token pair.
+      .mockResolvedValueOnce(
+        json({ device_token: "dt-rotated", refresh_token: "rt-rotated", expires_in: 300 }),
+      )
+      // 4: catalog fetch with the new token succeeds.
+      .mockResolvedValueOnce(json({ chat: [frontierEntry] }))
+      // 5: the chat POST itself.
+      .mockResolvedValueOnce(new Response("data: [DONE]\n\n", { status: 200 }));
+
+    const result = await qoderChat({
+      model: "qmodel_latest",
+      body: { messages: [{ role: "user", content: "hi" }] },
+      credentials: { ...credentials },
+      profile: "intl",
+    });
+
+    expect(String(refreshFetchMock.mock.calls[2][0])).toContain("/api/v1/deviceToken/refresh");
+    expect(result.refreshedCredentials).toMatchObject({
+      accessToken: "dt-rotated",
+      refreshToken: "rt-rotated",
+    });
+    expect(result.response.ok).toBe(true);
+    expect(result.transformedBody.model_config.key).toBe("qmodel_latest");
+  });
+
+  it("keeps the original error when no refresh token is available", async () => {
+    refreshFetchMock
+      .mockResolvedValueOnce(new Response("Signature invalid", { status: 401 }))
+      .mockResolvedValueOnce(new Response("Signature invalid", { status: 401 }));
+
+    const { refreshToken, ...noRefresh } = credentials;
+    const result = await qoderChat({
+      model: "qmodel_latest",
+      body: { messages: [{ role: "user", content: "hi" }] },
+      credentials: noRefresh,
+      profile: "intl",
+    });
+
+    expect(result.response.status).toBe(400);
+    expect(result.refreshedCredentials).toBeNull();
+    const errBody = await result.response.json();
+    expect(errBody.error.message).toMatch(/not yet known/);
+    expect(refreshFetchMock).toHaveBeenCalledTimes(2);
   });
 });

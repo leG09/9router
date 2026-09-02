@@ -17,9 +17,13 @@ import { createHash } from "crypto";
 import { proxyAwareFetch } from "../../utils/proxyFetch.js";
 import { buildCosyHeaders } from "./cosy.js";
 import { resolveProfile } from "./profile.js";
+import { QODER_AUTO_UPDATE_KEYS } from "./constants.js";
 
 const FETCH_TIMEOUT_MS = 15_000;
-const CACHE_TTL_MS = 60 * 60 * 1000; // 1h, same as the Kiro catalog
+// Providers auto-update the models behind aliases like qmodel_latest, so the
+// cached model_config must follow reasonably fast; a stale config can make
+// upstream silently downgrade to an older model.
+const CACHE_TTL_MS = 10 * 60 * 1000;
 
 /** @type {Map<string, { expiresAt: number, models: any[], rawConfigs: Map<string, object>, fetched: boolean }>} */
 const catalogCache = new Map();
@@ -161,6 +165,24 @@ async function fetchQoderCatalogRaw(credentials, signal, proxyOptions = null, pr
 }
 
 /**
+ * Pick the successor config for an auto-updated frontier alias (e.g.
+ * qmodel_latest) that the live catalog no longer publishes under that key.
+ * Providers flag the rotated-in model with is_new; follow that flag instead
+ * of failing. Returns { key, config } or null when there is no candidate.
+ * @param {{ rawConfigs?: Map<string, object> } | null} catalog
+ * @param {string} missingKey
+ */
+export function pickAutoUpdateSuccessor(catalog, missingKey) {
+  if (!catalog?.rawConfigs || !QODER_AUTO_UPDATE_KEYS.includes(missingKey)) return null;
+  for (const [key, config] of catalog.rawConfigs) {
+    if (key === missingKey) continue;
+    if (!config || config.enable === false) continue;
+    if (config.is_new === true) return { key, config };
+  }
+  return null;
+}
+
+/**
  * Get the cached model_config block for a given model key, fetching the
  * catalog first if needed. Returns null when the catalog can't be fetched
  * (so callers can fall back to the static registry).
@@ -203,8 +225,28 @@ export async function resolveQoderModels(credentials, options = {}) {
   }
 
   const fetchPromise = (async () => {
-    const fetched = await fetchQoderCatalogRaw(credentials, options.signal, options.proxyOptions, profile);
-    if (!fetched) return null;
+    const stale = catalogCache.get(key) || null;
+    let fetched = null;
+    try {
+      fetched = await fetchQoderCatalogRaw(credentials, options.signal, options.proxyOptions, profile);
+    } catch (error) {
+      options.log?.warn?.("QODER", `model list fetch failed: ${error?.message || error}`);
+    }
+    if (!fetched) {
+      // Fetch failed (auth/network/transient). Serving the last known
+      // model_config — even expired — keeps requests flowing after the
+      // provider rotates its models; failing here would lock healthy
+      // accounts on a router-side catalog problem.
+      if (stale) options.log?.warn?.("QODER", "model list fetch failed — serving stale catalog");
+      return stale;
+    }
+    // A successful-but-empty list is almost always a transient upstream glitch
+    // (model groups momentarily missing); never let it poison the cache and
+    // block every model for the whole TTL.
+    if (fetched.rawConfigs.size === 0 && stale && stale.rawConfigs.size > 0) {
+      options.log?.warn?.("QODER", "model list returned no entries — keeping previous catalog");
+      return stale;
+    }
     const entry = {
       expiresAt: Date.now() + CACHE_TTL_MS,
       models: fetched.models,

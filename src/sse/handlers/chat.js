@@ -15,6 +15,7 @@ import { DEFAULT_HEADROOM_URL } from "@/lib/headroom/detect";
 import { getTransform as getPxpipeTransform } from "@/lib/pxpipe/loader.js";
 import { appendPxpipeEvent } from "@/lib/pxpipe/events.js";
 import { errorResponse, unavailableResponse } from "open-sse/utils/error.js";
+import { isQoderCatalogMiss } from "open-sse/protocol/qoder/constants.js";
 import { handleComboChat, handleFusionChat, detectRequiredCapabilities } from "open-sse/services/combo.js";
 import { augmentModelsWithCapacityAdapter, withCapacityAdapterStripping, getActiveAdapterStrategy } from "open-sse/services/capacityAdapter.js";
 import { handleBypassRequest } from "open-sse/utils/bypassHandler.js";
@@ -311,6 +312,19 @@ async function handleSingleModelChat(body, modelStr, clientRawRequest = null, re
         refreshedCredentials.accessToken, credentials.providerSpecificData
       );
       if (quotaResetMs) resetsAtMs = quotaResetMs;
+    }
+
+    // A qoder model-catalog miss is router-side (model list unreachable or
+    // the provider rotated the model behind an auto-updated alias) — not an
+    // account fault. Try the next account WITHOUT persisting an
+    // unavailability mark: locking the account here made healthy accounts
+    // look dead whenever the provider updated its models.
+    if (isQoderCatalogMiss(result.error)) {
+      log.warn("FALLBACK", `⇄ ACC:${credentials.connectionName} CATALOG MISS (${result.status}) → NEXT ACCOUNT (not marked unavailable)`);
+      excludeConnectionIds.add(credentials.connectionId);
+      lastError = result.error;
+      lastStatus = result.status;
+      continue;
     }
 
     // Exhausted Antigravity model is blocked only in RAM cache until upstream resetAt.

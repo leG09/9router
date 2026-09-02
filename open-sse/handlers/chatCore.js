@@ -363,6 +363,15 @@ export async function handleChatCore({ body, modelInfo, credentials, log, onCred
     finalBody = result.transformedBody;
     providerResponseFormat = result.responseFormat || targetFormat;
     reqLogger.logTargetRequest(providerUrl, providerHeaders, finalBody);
+    // Executor-side credential refresh (e.g. qoder catalog-miss recovery):
+    // apply to the in-flight credentials and persist so the next request
+    // doesn't pay another refresh round-trip.
+    if (result.refreshedCredentials) {
+      Object.assign(credentials, result.refreshedCredentials);
+      if (onCredentialsRefreshed) {
+        try { await onCredentialsRefreshed(result.refreshedCredentials); } catch (e) { log?.warn?.("TOKEN", `onCredentialsRefreshed failed: ${e.message}`); }
+      }
+    }
   } catch (error) {
     trackPendingRequest(model, provider, connectionId, false, true);
     appendRequestLog({ model, provider, connectionId, status: `FAILED ${error.name === "AbortError" ? 499 : HTTP_STATUS.BAD_GATEWAY}` }).catch(() => { });

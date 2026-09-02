@@ -46,6 +46,27 @@ export function normalizeQoderMachineOs(arch = process.arch, platform = process.
 export const QODER_MACHINE_OS = normalizeQoderMachineOs();
 export const QODER_MACHINE_TYPE = "5";
 
+// Frontier aliases that follow the provider's auto-updated latest model.
+// Qoder/QwenWork rotate the model behind these keys server-side without
+// changing the key itself (or by publishing a flagged successor entry), so a
+// missing config for one of these keys should fall back to the catalog entry
+// the provider currently flags as new instead of failing the request.
+export const QODER_AUTO_UPDATE_KEYS = ["qmodel_latest"];
+
+// Marker inside catalog-miss error messages. Handlers use it to classify the
+// failure as a router-side catalog problem (never an account fault).
+export const QODER_CATALOG_MISS_MARKER = "not yet known";
+
+/**
+ * True when an error message is the qoder model-catalog miss (router-side:
+ * the live model list could not resolve the requested key). Such errors must
+ * not mark the account unavailable — the credential itself may be healthy.
+ * @param {string} message
+ */
+export function isQoderCatalogMiss(message) {
+  return typeof message === "string" && message.includes(QODER_CATALOG_MISS_MARKER);
+}
+
 // RSA public key for COSY (same across IDE / CN / CLIProxy family).
 export const QODER_RSA_PUBLIC_KEY = `-----BEGIN PUBLIC KEY-----
 MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQDA8iMH5c02LilrsERw9t6Pv5Nc

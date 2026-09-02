@@ -11,7 +11,8 @@
  */
 
 import { createHash, randomUUID } from "crypto";
-import { getQoderModelConfig, resolveQoderModels } from "./catalog.js";
+import { getQoderModelConfig, pickAutoUpdateSuccessor, resolveQoderModels } from "./catalog.js";
+import { QODER_CATALOG_MISS_MARKER } from "./constants.js";
 import { resolveProfile } from "./profile.js";
 import { resolveSessionId } from "../../utils/sessionManager.js";
 
@@ -319,7 +320,7 @@ async function buildQoderRequestBody({
 }) {
   const p = resolveProfile(profile);
   const requestedKey = String(model || "").replace(/^(?:qoder|qdcn)\//, "");
-  const qoderKey = p.modelAliases?.[requestedKey] || requestedKey;
+  let qoderKey = p.modelAliases?.[requestedKey] || requestedKey;
 
   let modelConfig = modelConfigInject;
   if (!modelConfig) {
@@ -337,10 +338,20 @@ async function buildQoderRequestBody({
         signal,
         profile: p,
       });
-      const retried = refreshed?.rawConfigs.get(qoderKey);
+      let retried = refreshed?.rawConfigs.get(qoderKey);
+      if (!retried) {
+        // Auto-update providers rotate the frontier model behind aliases like
+        // qmodel_latest; follow the successor entry they flag as new.
+        const successor = pickAutoUpdateSuccessor(refreshed, qoderKey);
+        if (successor) {
+          log?.warn?.("QODER", `model key "${qoderKey}" no longer published — following auto-update successor "${successor.key}"`);
+          qoderKey = successor.key;
+          retried = successor.config;
+        }
+      }
       if (!retried) {
         throw new Error(
-          `qoder: model_config for "${qoderKey}" not yet known (inject modelConfig or fetch model list)`,
+          `qoder: model_config for "${qoderKey}" ${QODER_CATALOG_MISS_MARKER} (inject modelConfig or fetch model list)`,
         );
       }
       modelConfig = { ...retried, key: qoderKey };
