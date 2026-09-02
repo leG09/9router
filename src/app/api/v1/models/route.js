@@ -44,6 +44,22 @@ const LIVE_MODEL_RESOLVERS = {
       models: result.models.map((m) => ({ id: m.id, name: m.name })),
     };
   },
+  // QoderWork CN accounts expose an account-specific live catalog (e.g. only
+  // pro/flash/<frontier>) — the static qwork-* registry entries do not exist
+  // on enterprise accounts. Prefer the live catalog like the other resolvers.
+  "qoderwork-cn": async (conn) => {
+    const result = await resolveQoderModels({
+      accessToken: conn.accessToken,
+      refreshToken: conn.refreshToken,
+      email: conn.email,
+      displayName: conn.displayName,
+      providerSpecificData: conn.providerSpecificData || {}
+    }, { profile: "cn-work" });
+    if (!result?.models?.length) return null;
+    return {
+      models: result.models.map((m) => ({ id: m.id, name: m.name })),
+    };
+  },
   kimchi: async (conn) => {
     const result = await resolveKimchiModels({
       accessToken: conn.accessToken,
