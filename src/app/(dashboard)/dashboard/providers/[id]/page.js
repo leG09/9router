@@ -106,6 +106,12 @@ export default function ProviderDetailPage() {
   const [autoPing, setAutoPing] = useState({ enabled: false, connections: {} });
   const [suggestedModels, setSuggestedModels] = useState([]);
   const [liveModels, setLiveModels] = useState([]);
+  // Account-specific catalogs (cursor / qoderwork-cn): true while the live
+  // catalog fetch is in flight, so the Models section doesn't flash a wrong
+  // fallback list before the real catalog arrives.
+  const [liveModelsLoading, setLiveModelsLoading] = useState(
+    () => providerId === "cursor" || providerId === "qoderwork-cn"
+  );
   const [kiloFreeModels, setKiloFreeModels] = useState([]);
   const [disabledModelIds, setDisabledModelIds] = useState([]);
   const [confirmState, setConfirmState] = useState(null);
@@ -182,9 +188,6 @@ export default function ProviderDetailPage() {
   const supportsApiKeyAuth = !!APIKEY_PROVIDERS[providerId] || authModes.includes("apikey");
   const isFreeNoAuth = !!FREE_PROVIDERS[providerId]?.noAuth;
   const staticModels = getModelsByProviderId(providerId);
-  const models = (providerId === "cursor" || providerId === "qoderwork-cn") && liveModels.length > 0
-    ? liveModels
-    : staticModels;
   const providerAlias = getProviderAlias(providerId);
   
   const isOpenAICompatible = isOpenAICompatibleProvider(providerId);
@@ -208,6 +211,21 @@ export default function ProviderDetailPage() {
     return levels && levels.includes(thinkingMode) ? thinkingMode : null;
   };
   const providerStorageAlias = isCompatible ? providerId : providerAlias;
+  // QoderWork CN serves account-specific live catalogs. When the live fetch has
+  // not (yet) returned anything, prefer the last synced catalog — persisted as
+  // custom models — over the static registry, whose qwork-* entries do not
+  // exist on enterprise accounts and produce phantom/duplicate model rows.
+  const hasLiveTargets = connections.some((c) => c.provider === providerId && c.isActive !== false && c.id);
+  const importedQdcnModels = providerId === "qoderwork-cn"
+    ? customModels
+        .filter((m) => m.providerAlias === providerStorageAlias && (m.kind || m.type || "llm") === "llm")
+        .map((m) => ({ id: m.id, name: m.name || m.id }))
+    : [];
+  const models = (providerId === "cursor" || providerId === "qoderwork-cn") && liveModels.length > 0 && hasLiveTargets
+    ? liveModels
+    : importedQdcnModels.length > 0
+      ? importedQdcnModels
+      : staticModels;
   // Union of levels across this provider's reasoning models — drives the level picker options.
   // Include custom models too (e.g. manually added gpt-5.6-sol → max).
   const providerThinkingLevels = (() => {
@@ -501,13 +519,18 @@ export default function ProviderDetailPage() {
   // merge all active account results and use the static registry as fallback.
   useEffect(() => {
     if (providerId !== "cursor" && providerId !== "qoderwork-cn") return;
+    const targets = connections.filter((c) => c.provider === providerId && c.isActive !== false && c.id);
+    if (targets.length === 0) return; // no live source — fallback lists apply
 
     let cancelled = false;
     fetchLiveModelsForConnections(providerId, connections)
       .then((nextModels) => {
         if (!cancelled) setLiveModels(nextModels);
       })
-      .catch(() => {});
+      .catch(() => {})
+      .finally(() => {
+        if (!cancelled) setLiveModelsLoading(false);
+      });
 
     return () => { cancelled = true; };
   }, [providerId, connections]);
@@ -1105,6 +1128,23 @@ export default function ProviderDetailPage() {
           connections={connections}
           isAnthropic={isAnthropicCompatible}
         />
+      );
+    }
+    // Account-specific catalog providers: while the live catalog fetch is in
+    // flight and no synced catalog exists yet, don't flash the static fallback
+    // list (its entries may not exist on these accounts).
+    if (
+      (providerId === "cursor" || providerId === "qoderwork-cn") &&
+      liveModelsLoading &&
+      hasLiveTargets &&
+      liveModels.length === 0 &&
+      models === staticModels
+    ) {
+      return (
+        <div className="flex items-center gap-2 py-2 text-sm text-gray-400">
+          <span className="inline-block h-4 w-4 animate-spin rounded-full border-2 border-gray-300 border-t-transparent" />
+          {translate("Loading live models")}…
+        </div>
       );
     }
     // Combine hardcoded models with Kilo free models (deduplicated)
